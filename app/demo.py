@@ -28,7 +28,7 @@ This application allows you to:
 - Preprocess the text and classify resumes into job categories
 """)
 
-uploaded_file = st.file_uploader("📂 Upload your resume CSV", type=["csv"])
+uploaded_file = st.file_uploader("Upload your resume CSV", type=["csv"])
 
 CHUNK_SIZE = 50  # Tune this based on available memory
 CHUNK_OVERLAP = 0  # Optional: overlap in rows between chunks if needed
@@ -53,17 +53,17 @@ def process_in_chunks(file, model):
     return pd.concat(predictions, ignore_index=True)
 
 if uploaded_file is not None:
-    with st.spinner("⏳ Processing resumes..."):
+    with st.spinner("Processing resumes..."):
         df_result = process_in_chunks(uploaded_file, model)
 
-    st.success("✅ Resume classification complete!")
-    st.subheader("🔍 Sample Predictions")
+    st.success("Resume classification complete!")
+    st.subheader("Sample Predictions")
     st.dataframe(df_result[['Resume_str', 'Predicted_Category']].head())
 
     csv_download = df_result.to_csv(index=False)
-    st.download_button("📥 Download Full Predictions", data=csv_download, file_name="resume_predictions.csv", mime="text/csv")
+    st.download_button("Download Full Predictions", data=csv_download, file_name="resume_predictions.csv", mime="text/csv")
 else:
-    st.info("ℹ️ Please upload a CSV file containing a 'Resume_str' column.")
+    st.info("Please upload a CSV file containing a 'Resume_str' column.")
 
 def load_resume_text():
     print("Choose Input Method:")
