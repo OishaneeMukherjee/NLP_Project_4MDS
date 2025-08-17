@@ -7,12 +7,27 @@ from nltk.wsd import lesk
 from sklearn.feature_extraction.text import TfidfVectorizer
 from urllib.parse import urlparse, unquote
 from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 
+from transformers import pipeline
+
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+
+# Summarizer (HuggingFace BART model)
+try:
+    tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
+    model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large-cnn")
+    summarizer = pipeline("summarization", model=model, tokenizer=tokenizer)
+except Exception as e:
+    st.error(f"Summarization model not available: {e}")
+    summarizer = None
+
+    
 # Extended Lesk (better WSD)
 try:
     from pywsd.lesk import simple_lesk
 except:
-    st.warning("⚠️ pywsd not installed. Run: pip install pywsd")
+    st.warning("pywsd not installed. Run: pip install pywsd")
 
 # NLTK downloads
 nltk.download('punkt')
@@ -22,14 +37,14 @@ nlp = spacy.load("en_core_web_sm")
 try:
     nlp = spacy.load("en_core_web_md")
 except:
-    st.error("⚠️ SpaCy model not found. Run: python -m spacy download en_core_web_md")
+    st.error("SpaCy model not found. Run: python -m spacy download en_core_web_md")
 
 # ---------------------------
 # Streamlit Config
 # ---------------------------
 st.set_page_config(page_title="Wikipedia NLP Project", layout="wide")
 
-st.title("📘 Wikipedia NLP Explorer")
+st.title("Wikipedia NLP Explorer")
 st.write("Analyze any Wikipedia page by pasting its URL below.")
 
 # ---------------------------
@@ -44,26 +59,58 @@ def extract_title_from_url(url):
         return None
 
 # ---------------------------
+
+# Input field for Wikipedia URL
+# ---------------------------
+wiki_url = st.text_input("Enter Wikipedia URL:", "")
+
 # Fetch Wikipedia Page
 # ---------------------------
-st.header("📄 Fetch Wikipedia Page")
-wiki_url = st.text_input("Paste a Wikipedia page URL:")
-
 if st.button("Fetch Page"):
     title = extract_title_from_url(wiki_url)
     if title:
         try:
             page = wikipedia.page(title)
             st.session_state['page_title'] = title
-            st.session_state['page_summary'] = wikipedia.summary(title, sentences=5)
             st.session_state['page_content'] = page.content
-            st.success(f"✅ Fetched page: {title}")
-            st.subheader("Summary:")
-            st.write(st.session_state['page_summary'])
+
+            st.success(f"Fetched page: {title}")
+
+            # Generate summary using full content
+            if summarizer:
+                try:
+                    sentences = nltk.sent_tokenize(st.session_state['page_content'])
+                    chunks, current_chunk = [], []
+                    max_chunk_words = 800  # safe limit for BART
+
+                    for sentence in sentences:
+                        if sum(len(s.split()) for s in current_chunk) + len(sentence.split()) <= max_chunk_words:
+                            current_chunk.append(sentence)
+                        else:
+                            chunks.append(" ".join(current_chunk))
+                            current_chunk = [sentence]
+                    if current_chunk:
+                        chunks.append(" ".join(current_chunk))
+
+                    summaries = []
+                    for chunk in chunks:
+                        res = summarizer(chunk, max_length=200, min_length=50, do_sample=False)
+                        summaries.append(res[0]['summary_text'])
+
+                    final_summary = " ".join(summaries)
+
+                    st.subheader("Generated Summary:")
+                    st.write(final_summary.strip())
+
+                except Exception as e:
+                    st.error(f"Error during summarization: {e}")
+            else:
+                st.warning("Summarizer not initialized.")
         except Exception as e:
             st.error(f"Error fetching page: {e}")
     else:
-        st.warning("⚠️ Please enter a valid Wikipedia URL.")
+        st.warning("Please enter a valid Wikipedia URL.")
+
 
 # ---------------------------
 # NLP Tasks (only if content exists)
@@ -73,14 +120,52 @@ if 'page_content' in st.session_state:
     limited_text = text[:5000]  # limit for efficiency
 
     # Preview
-    with st.expander("🔎 Preview Article Content"):
+    with st.expander("Preview Article Content"):
         st.write(limited_text[:1000] + "...")
         st.info("Showing first 1000 characters.")
 
+
+     # Wikipedia Page Summarization
+    # ---------------------------
+    with st.expander("Wikipedia Page Summarization"):
+        st.write("This generates a concise summary of the entire article using an abstractive NLP model.")
+
+        if st.button("Summarize Article"):
+            if summarizer:
+                try:
+                    # Sentence-based chunking for better summaries
+                    sentences = nltk.sent_tokenize(text)
+                    chunks, current_chunk = [], []
+                    max_chunk_words = 800  # safe limit for BART
+
+                    for sentence in sentences:
+                        if sum(len(s.split()) for s in current_chunk) + len(sentence.split()) <= max_chunk_words:
+                            current_chunk.append(sentence)
+                        else:
+                            chunks.append(" ".join(current_chunk))
+                            current_chunk = [sentence]
+                    if current_chunk:
+                        chunks.append(" ".join(current_chunk))
+
+                    st.info(f"Article split into {len(chunks)} chunks for summarization.")
+
+                    summaries = []
+                    for i, chunk in enumerate(chunks):
+                        res = summarizer(chunk, max_length=200, min_length=50, do_sample=False)
+                        summaries.append(res[0]['summary_text'])
+
+                    final_summary = " ".join(summaries)
+
+                    st.subheader("Generated Summary:")
+                    st.write(final_summary.strip())
+                except Exception as e:
+                    st.error(f"Error during summarization: {e}")
+            else:
+                st.warning("Summarizer not initialized.")
     # ---------------------------
     # Keyword Extraction
     # ---------------------------
-    with st.expander("📝 Keyword Extraction (TF-IDF)"):
+    with st.expander("Keyword Extraction (TF-IDF)"):
         if st.button("Extract Keywords"):
             vectorizer = TfidfVectorizer(stop_words='english')
             X = vectorizer.fit_transform([limited_text])
@@ -93,7 +178,7 @@ if 'page_content' in st.session_state:
     # ---------------------------
     # Semantic Analysis
     # ---------------------------
-    with st.expander("🔎 Semantic Analysis"):
+    with st.expander("Semantic Analysis"):
         st.write("This finds the most semantically related sentence pairs from the Wikipedia page.")
 
         if st.button("Run Semantic Analysis"):
@@ -118,13 +203,13 @@ if 'page_content' in st.session_state:
             for (sent_pair, score) in results:
                 st.markdown(f"**Sentence 1:** {sent_pair[0]}")
                 st.markdown(f"**Sentence 2:** {sent_pair[1]}")
-                st.write(f"🔗 **Similarity Score:** {score:.4f}")
+                st.write(f"**Similarity Score:** {score:.4f}")
                 st.markdown("---")
 
     # ---------------------------
     # Word Sense Disambiguation
     # ---------------------------
-    with st.expander("🔗 Word Sense Disambiguation (WSD)"):
+    with st.expander("Word Sense Disambiguation (WSD)"):
         sentence = st.text_input("Enter a sentence from the article:", key="wsd_sentence")
         target_word = st.text_input("Enter the target word:", key="wsd_word")
 
@@ -148,5 +233,3 @@ if 'page_content' in st.session_state:
                     st.error(f"Error: {e}")
             else:
                 st.warning("Please provide both sentence and target word.")
-else:
-    st.warning("⚠️ Please fetch a Wikipedia page first.")
