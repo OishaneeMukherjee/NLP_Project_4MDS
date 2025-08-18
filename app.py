@@ -1,418 +1,371 @@
+import re
+import matplotlib.pyplot as plt
+from collections import Counter
+
 import streamlit as st
 import wikipedia
 import nltk
-import spacy
-from nltk.corpus import wordnet as wn
+from nltk.corpus import stopwords, wordnet as wn
 from nltk.wsd import lesk
 from sklearn.feature_extraction.text import TfidfVectorizer
-from urllib.parse import urlparse, unquote
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from wordcloud import WordCloud
 
-from transformers import pipeline
+# ---------------------------
+# NLTK setup
+# ---------------------------
+nltk.download("punkt")
+nltk.download("stopwords")
+nltk.download("wordnet")
 
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+STOP_WORDS = set(stopwords.words("english"))
 
-# Summarizer (HuggingFace BART model)
-try:
-    tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
-    model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large-cnn")
-    summarizer = pipeline("summarization", model=model, tokenizer=tokenizer)
-except Exception as e:
-    st.error(f"Summarization model not available: {e}")
-    summarizer = None
+# ---------------------------
+# Utilities
+# ---------------------------
 
-    
-# Extended Lesk (better WSD)
-try:
-    from pywsd.lesk import simple_lesk
-except:
-    st.warning("pywsd not installed. Run: pip install pywsd")
-
-# NLTK downloads
-nltk.download('punkt')
-nltk.download('wordnet')
-nlp = spacy.load("en_core_web_sm") 
-# Load SpaCy model (for semantic similarity)
-try:
-    nlp = spacy.load("en_core_web_md")
-except:
-    st.error("SpaCy model not found. Run: python -m spacy download en_core_web_md")
-
-
-# ---- TF-IDF extractive summarizer (entire page, no chunking) ----
-def tfidf_extractive_summary(full_text: str, ratio: float = 0.25, max_chars: int = 4000) -> str:
-    """
-    Summarize full_text by selecting top-K sentences via sentence-level TF-IDF scores.
-    - ratio: fraction of sentences to keep (0.05–0.6 typical)
-    - max_chars: hard safety cap for Streamlit rendering
-    """
-    if not full_text or not full_text.strip():
+def clean_wiki_markup(text: str) -> str:
+    """Remove common Wikipedia markup (headings, refs like [1], templates)."""
+    if not text:
         return ""
+    t = text
 
-    # 1) Sentence segmentation (fast & robust)
-    sentences = nltk.sent_tokenize(full_text)
-    if len(sentences) == 0:
-        return ""
+    # remove references like [1], [2], [note 3]
+    t = re.sub(r"\[\s*\d+\s*\]", " ", t)
+    t = re.sub(r"\[\s*note\s*\d+\s*\]", " ", t, flags=re.I)
 
-    # 2) Build sentence-level TF-IDF
-    # Each sentence is treated as a "document". Score is sum of tf-idf weights.
-    vectorizer = TfidfVectorizer(stop_words="english")
+    # remove file/template curly braces crudely {{...}}
+    t = re.sub(r"\{\{[^{}]*\}\}", " ", t)
+
+    # strip heading markup '== Heading ==' lines
+    t = re.sub(r"(?m)^\s*={2,6}\s*.+?\s*={2,6}\s*$", " ", t)
+
+    # collapse whitespace
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def parse_sections_from_content(content: str):
+    """
+    Parse sections using Wikipedia-style headings:
+    == H2 ==, === H3 ===, etc.
+    Returns a list of (level, title, text).
+    """
+    if not content:
+        return []
+
+    pattern = re.compile(r"(?m)^(={2,6})\s*(.+?)\s*\1\s*$")
+    matches = list(pattern.finditer(content))
+
+    sections = []
+    if not matches:
+        # no headings found – treat whole thing as Introduction
+        sections.append((2, "Introduction", content.strip()))
+        return sections
+
+    # Add an implicit intro if there is text before first heading
+    start0 = 0
+    if matches[0].start() > 0:
+        intro_text = content[:matches[0].start()].strip()
+        if intro_text:
+            sections.append((2, "Introduction", intro_text))
+
+    # Walk headings
+    for i, m in enumerate(matches):
+        level = len(m.group(1))
+        title = m.group(2).strip()
+
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        body = content[start:end].strip()
+
+        sections.append((level, title, body))
+
+    return sections
+
+
+def get_sections(page, content: str):
+    """
+    Prefer wikipedia.Page.sections (titles) + page.section(title) to fetch text.
+    Fallback to regex parsing on raw content for completeness.
+    """
+    out = []
     try:
-        X = vectorizer.fit_transform(sentences)  # shape: [n_sentences, n_terms]
-    except ValueError:
-        # happens if text is too small or all stopwords
-        return "Content too short to summarize."
+        titles = getattr(page, "sections", None) or []
+        if titles:
+            # Top-level titles; fetch text for each
+            for title in titles:
+                sec_text = page.section(title) or ""
+                if sec_text.strip():
+                    out.append((2, title, sec_text.strip()))
+        # If nothing came back, fall back to regex parsing
+        if not out:
+            out = parse_sections_from_content(content)
+    except Exception:
+        out = parse_sections_from_content(content)
 
-    # 3) Score sentences and pick top-K by score
-    # Sum TF-IDF weights across terms for each sentence
-    scores = X.sum(axis=1)  # sparse matrix -> column vector
-    # Convert to flat Python list of floats
-    scores = [float(scores[i, 0]) for i in range(scores.shape[0])]
-
-    k = max(1, int(len(sentences) * max(min(ratio, 1.0), 0.01)))
-    # indices of top-K sentences by score
-    ranked_idx = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:k]
-    # restore original order for readability
-    ranked_idx.sort()
-
-    summary = " ".join(sentences[i] for i in ranked_idx).strip()
-
-    # 4) Safety cap for UI stability
-    if len(summary) > max_chars:
-        summary = summary[:max_chars].rsplit(" ", 1)[0] + "..."
-
-    return summary
+    # Deduplicate by title while preserving order
+    seen = set()
+    uniq = []
+    for lvl, t, txt in out:
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((lvl, t, txt))
+    return uniq
 
 
-# # === Extractive (TF-IDF) summarizer helpers ===
-# from nltk.stem import WordNetLemmatizer
-# import math
+def sent_clean(s: str) -> str:
+    s = s.strip()
+    # drop leftover equals heading lines or junk
+    if re.match(r"^=+", s):
+        return ""
+    return s
 
-# lemmatizer = WordNetLemmatizer()
 
-# def _freq_matrix_spacy(sentences, nlp_obj):
-#     freq_matrix = {}
-#     stop_words = nlp_obj.Defaults.stop_words
+def extractive_summary_tfidf_mmr(
+    text: str,
+    ratio: float = 0.18,
+    min_sentences: int = 5,
+    max_sentences: int = 12,
+    mmr_lambda: float = 0.65,
+):
+    """
+    Extractive summary using sentence-level TF-IDF with MMR to reduce redundancy.
+    - ratio: fraction of sentences to keep
+    - min/max_sentences: bounds for output length
+    - mmr_lambda: tradeoff between relevance and diversity (0-1)
+    """
+    if not text or not text.strip():
+        return ""
 
-#     for sent in sentences:
-#         freq_table = {}
-#         # keep only alpha-numeric tokens; lower; lemmatize
-#         words = [t.text.lower() for t in sent if t.text.isalnum()]
-#         for w in words:
-#             w = lemmatizer.lemmatize(w)
-#             if w in stop_words or not w:
-#                 continue
-#             freq_table[w] = freq_table.get(w, 0) + 1
+    # 1) Clean markup for better sentence splitting & features
+    cleaned = clean_wiki_markup(text)
 
-#         # use a short, stable key for the sentence
-#         key = sent.text[:15]
-#         freq_matrix[key] = freq_table
+    # 2) Sentence segmentation + basic filtering
+    sentences = [sent_clean(s) for s in nltk.sent_tokenize(cleaned)]
+    sentences = [s for s in sentences if s and len(s.split()) >= 8]  # drop tiny/noisy
 
-#     return freq_matrix
-
-# def _tf_matrix_from_freq(freq_matrix):
-#     tf_matrix = {}
-#     for s_key, ftab in freq_matrix.items():
-#         tf_tab = {}
-#         denom = max(len(ftab), 1)
-#         for w, c in ftab.items():
-#             tf_tab[w] = c / denom
-#         tf_matrix[s_key] = tf_tab
-#     return tf_matrix
-
-# def _sentences_per_word(freq_matrix):
-#     spw = {}
-#     for _, ftab in freq_matrix.items():
-#         for w in ftab.keys():
-#             spw[w] = spw.get(w, 0) + 1
-#     return spw
-
-# def _idf_matrix_from(freq_matrix, spw, total_sents):
-#     idf_matrix = {}
-#     for s_key, ftab in freq_matrix.items():
-#         idf_tab = {}
-#         for w in ftab.keys():
-#             # add 1 smoothing to avoid div-by-zero
-#             idf_tab[w] = math.log10((total_sents + 1) / float(spw.get(w, 1)))
-#         idf_matrix[s_key] = idf_tab
-#     return idf_matrix
-
-# def _tfidf_matrix(tf_mat, idf_mat):
-#     tfidf = {}
-#     for (s_key, tf_tab) in tf_mat.items():
-#         idf_tab = idf_mat.get(s_key, {})
-#         tfidf_tab = {}
-#         for w, tfv in tf_tab.items():
-#             tfidf_tab[w] = tfv * idf_tab.get(w, 0.0)
-#         tfidf[s_key] = tfidf_tab
-#     return tfidf
-
-# def _score_sentences(tfidf):
-#     scores = {}
-#     for s_key, tab in tfidf.items():
-#         if not tab:
-#             continue
-#         scores[s_key] = sum(tab.values()) / len(tab)
-#     return scores
-
-# def _average_score(scores):
-#     if not scores:
-#         return 0.0
-#     return sum(scores.values()) / len(scores)
-
-# def extractive_tfidf_summary(full_text, nlp_obj, ratio=0.25, boost=1.3, max_chars=4000):
-#     """
-#     ratio: approx fraction of sentences to keep (0<ratio<=1)
-#     boost: threshold multiplier (higher = shorter summary)
-#     max_chars: final safe cap to avoid UI crashes
-#     """
-#     if not full_text or not full_text.strip():
-#         return ""
-
-    # Process with SpaCy (robust to long docs)
-    doc = nlp_obj(full_text)
-    sentences = list(doc.sents)
     if not sentences:
         return ""
 
-    freq = _freq_matrix_spacy(sentences, nlp_obj)
-    tfm  = _tf_matrix_from_freq(freq)
-    spw  = _sentences_per_word(freq)
-    idfm = _idf_matrix_from(freq, spw, len(sentences))
-    tfidf = _tfidf_matrix(tfm, idfm)
-    s_scores = _score_sentences(tfidf)
-    avg = _average_score(s_scores)
-
-    # dynamic threshold from ratio + boost
-    # sort sentences by score, pick top-k ~ ratio
-    k = max(1, int(len(sentences) * min(max(ratio, 0.05), 1.0)))
-    ranked = sorted(
-        ((i, s, s_scores.get(s.text[:15], 0.0)) for i, s in enumerate(sentences)),
-        key=lambda x: x[2],
-        reverse=True
+    # 3) TF-IDF on sentences (use unigrams+bigrams; ignore very common/rare)
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        max_df=0.85,
+        min_df=2,
     )
-    top_idx = set(i for i, _, _ in ranked[:k])
+    try:
+        tfidf = vectorizer.fit_transform(sentences)  # [n_sent, n_terms]
+    except ValueError:
+        # fallback when text is very short
+        return " ".join(sentences[:max(min_sentences, 3)])
 
-    # keep original order
-    selected = [sentences[i].text for i in range(len(sentences)) if i in top_idx]
-    summary = " ".join(selected).strip()
+    # 4) Base scores = sum of TF-IDF weights per sentence
+    base_scores = tfidf.sum(axis=1).A1  # flatten to 1D array
 
-    # safe truncate for Streamlit
-    if len(summary) > max_chars:
-        summary = summary[:max_chars].rsplit(" ", 1)[0] + "..."
+    # 5) Target sentence count
+    k = max(min_sentences, min(max_sentences, int(len(sentences) * ratio)))
+    if len(sentences) <= k:
+        return " ".join(sentences)
 
+    # 6) MMR selection to avoid redundancy
+    sim_matrix = cosine_similarity(tfidf)  # sentence-to-sentence similarity
+    selected = []
+    candidates = list(range(len(sentences)))
+    # pick the highest scoring sentence first
+    first = max(candidates, key=lambda i: base_scores[i])
+    selected.append(first)
+    candidates.remove(first)
+
+    while len(selected) < k and candidates:
+        def mmr_score(i):
+            relevance = base_scores[i]
+            diversity = max(sim_matrix[i][j] for j in selected) if selected else 0.0
+            return mmr_lambda * relevance - (1 - mmr_lambda) * diversity
+
+        nxt = max(candidates, key=mmr_score)
+        selected.append(nxt)
+        candidates.remove(nxt)
+
+    # 7) Restore original order for readability
+    selected.sort()
+    summary = " ".join(sentences[i] for i in selected)
     return summary
 
 
+def page_stats(content: str):
+    tokens = nltk.word_tokenize(content)
+    words = [w.lower() for w in tokens if w.isalpha()]
+    unique_words = set(words)
+    read_time_min = max(1, round(len(words) / 200))  # ~200 wpm
+    return len(words), len(unique_words), read_time_min, words
 
-# ---------------------------
-# Streamlit Config
-# ---------------------------
-st.set_page_config(page_title="Wikipedia NLP Project", layout="wide")
 
-st.title("Wikipedia NLP Explorer")
-st.write("Analyze any Wikipedia page by pasting its URL below.")
+def draw_wordcloud(words):
+    if not words:
+        return
+    wc = WordCloud(width=900, height=450, background_color="white").generate(" ".join(words))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    st.pyplot(fig)
 
+
+def top_term_freq(words, k=20):
+    freq = Counter(words)
+    return freq.most_common(k)
+
+
+def keyword_extraction_tfidf(content: str, k: int = 15):
+    vec = TfidfVectorizer(stop_words="english", max_features=k)
+    X = vec.fit_transform([content])
+    return list(vec.get_feature_names_out())
+
+
+def perform_wsd(sentence: str, word: str):
+    sense = lesk(nltk.word_tokenize(sentence), word)
+    if sense:
+        return {
+            "word": word,
+            "synset": sense.name(),
+            "definition": sense.definition(),
+            "examples": sense.examples(),
+        }
+    return None
+
+def perform_pos_tagging(text: str, num_sentences: int = 5):
+    """Return POS tags for first N sentences of text."""
+    sentences = nltk.sent_tokenize(text)
+    tagged_sentences = []
+    for sent in sentences[:num_sentences]:
+        tokens = nltk.word_tokenize(sent)
+        pos_tags = nltk.pos_tag(tokens)
+        tagged_sentences.append((sent, pos_tags))
+    return tagged_sentences
+
+
+def perform_ner(text: str, num_sentences: int = 5):
+    """Return NER chunks for first N sentences of text."""
+    sentences = nltk.sent_tokenize(text)
+    ner_results = []
+    for sent in sentences[:num_sentences]:
+        tokens = nltk.word_tokenize(sent)
+        pos_tags = nltk.pos_tag(tokens)
+        chunks = nltk.ne_chunk(pos_tags, binary=False)
+        ner_results.append((sent, chunks))
+    return ner_results
 # ---------------------------
-# Extract title from Wikipedia URL
+# Streamlit UI
 # ---------------------------
-def extract_title_from_url(url):
+
+st.set_page_config(page_title="Wikipedia NLP Analyzer", layout="wide")
+st.title("📘 Wikipedia Page Analyzer")
+
+wiki_url = st.text_input("Enter Wikipedia URL (e.g., https://en.wikipedia.org/wiki/Photosynthesis):", "")
+
+if wiki_url:
     try:
-        path = urlparse(url).path  # /wiki/Photosynthesis
-        title = path.split("/wiki/")[-1]
-        return unquote(title.replace("_", " "))
-    except:
-        return None
+        # Extract title from URL (last part; handle underscores)
+        raw_title = wiki_url.strip().split("/")[-1]
+        title = re.sub(r"_", " ", raw_title)
+        page = wikipedia.page(title)
+        raw_content = page.content or ""
+        content = raw_content.strip()
 
-# ---------------------------
+        # 1) Preview
+        st.header("👀 Preview (first 1000 chars)")
+        st.write(content[:1000] + ("..." if len(content) > 1000 else ""))
 
-# Input field for Wikipedia URL
-# ---------------------------
-wiki_url = st.text_input("Enter Wikipedia URL:", "")
+        # 2) Section Breakdown (fixed)
+        st.header("📑 Section Breakdown")
+        sections = get_sections(page, content)
+        if sections:
+            for lvl, sec_title, sec_text in sections:
+                # Indent by level for visual hierarchy
+                indent = " " * max(0, lvl - 2)
+                st.subheader(f"{indent}{sec_title}")
+                snippet = sec_text[:600] + ("..." if len(sec_text) > 600 else "")
+                st.write(snippet)
+        else:
+            st.info("No sections detected. Showing introduction only.")
+            st.write(content[:1200] + ("..." if len(content) > 1200 else ""))
 
-# Fetch Wikipedia Page
-# ---------------------------
-if st.button("Fetch Page"):
-    title = extract_title_from_url(wiki_url)
-    if title:
-        try:
-            # Normalize title
-            query = title.strip()
+        # 3) Extractive Summary (TF-IDF + MMR) — fixed & stronger
+        st.header("📝 Extractive Summary (TF-IDF)")
+        col1, col2 = st.columns(2)
+        with col1:
+            ratio = st.slider("Summary ratio (fraction of sentences)", 0.05, 0.40, 0.18, 0.01)
+        with col2:
+            mmr_lambda = st.slider("MMR λ (relevance ↔ diversity)", 0.10, 0.95, 0.65, 0.05)
 
-            # Search for possible matches
-            search_results = wikipedia.search(query)
-            if not search_results:
-                st.error(f"No results found for: {query}")
-            else:
-                # Prefer exact match if available
-                exact_match = next((r for r in search_results if r.lower() == query.lower()), None)
-
-                if exact_match:
-                    best_match = exact_match
-                else:
-                    best_match = search_results[0]  # fallback
-
-                page = wikipedia.page(best_match)
-
-                st.session_state['page_title'] = best_match
-                st.session_state['page_content'] = page.content
-
-                st.success(f"Fetched page: {best_match}")
-    
-    #         # Generate summary using full content
-    #         if summarizer:
-    #             try:
-    #                 sentences = nltk.sent_tokenize(st.session_state['page_content'])
-    #                 chunks, current_chunk = [], []
-    #                 max_chunk_words = 800  # safe limit for BART
-
-    #                 for sentence in sentences:
-    #                     if sum(len(s.split()) for s in current_chunk) + len(sentence.split()) <= max_chunk_words:
-    #                         current_chunk.append(sentence)
-    #                     else:
-    #                         chunks.append(" ".join(current_chunk))
-    #                         current_chunk = [sentence]
-    #                 if current_chunk:
-    #                     chunks.append(" ".join(current_chunk))
-
-    #                 summaries = []
-    #                 for chunk in chunks:
-    #                     res = summarizer(chunk, max_length=200, min_length=50, do_sample=False)
-    #                     summaries.append(res[0]['summary_text'])
-
-    #                 final_summary = " ".join(summaries)
-
-    #                 st.subheader("Generated Summary:")
-    #                 st.write(final_summary.strip())
-
-    #             except Exception as e:
-    #                 st.error(f"Error during summarization: {e}")
-    #         else:
-    #             st.warning("Summarizer not initialized.")
-        except Exception as e:
-            st.error(f"Error fetching page: {e}")
-    else:
-        st.warning("Please enter a valid Wikipedia URL.")
-
-
-# ---------------------------
-# NLP Tasks (only if content exists)
-# ---------------------------
-if 'page_content' in st.session_state:
-    text = st.session_state['page_content']
-    limited_text = text[:5000]  # limit for efficiency
-
-    # Preview
-    with st.expander("Preview Article Content"):
-        st.write(limited_text[:1000] + "...")
-        st.info("Showing first 1000 characters.")
-
-
-    
-# ---------------------------
-# Wikipedia Page Summarization
-# ---------------------------
-with st.expander("Wikipedia Page Summarization"):
-    st.write("Generate a fast extractive summary of the entire article using sentence-level TF-IDF.")
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        ratio = st.slider(
-            "Summary length (fraction of sentences kept)",
-            0.05, 0.60, 0.25, 0.05
-        )
-    with col_b:
-        max_chars = st.number_input(
-            "Max summary characters (safety cap)",
-            min_value=500, max_value=10000, value=4000, step=250
-        )
-
-    if st.button("Summarize Article"):
-        try:
-            summary_text = tfidf_extractive_summary(
-                full_text=text,
-                ratio=float(ratio),
-                max_chars=int(max_chars),
+        if st.button("Generate Summary"):
+            summary = extractive_summary_tfidf_mmr(
+                text=content,
+                ratio=ratio,
+                mmr_lambda=mmr_lambda,
             )
-            if not summary_text:
-                st.warning("Could not generate a summary (empty or very short content).")
+            if not summary:
+                st.warning("Could not generate a summary (content may be too short).")
             else:
-                st.subheader("Generated Summary (Extractive TF-IDF):")
-                st.write(summary_text)
-                st.info(f"Original length: {len(text.split())} words → Summary length: {len(summary_text.split())} words")
-        except Exception as e:
-            st.error(f"Error during summarization: {e}")
+                st.write(summary)
 
+        # 4) Page Stats
+        st.header("📊 Page Statistics")
+        wc, uw, rt, words = page_stats(clean_wiki_markup(content))
+        st.write(f"**Word Count:** {wc}")
+        st.write(f"**Unique Words:** {uw}")
+        st.write(f"**Estimated Read Time:** {rt} minute(s)")
 
-    # ---------------------------
-    # Keyword Extraction
-    # ---------------------------
-    with st.expander("Keyword Extraction (TF-IDF)"):
-        if st.button("Extract Keywords"):
-            vectorizer = TfidfVectorizer(stop_words='english')
-            X = vectorizer.fit_transform([limited_text])
-            scores = zip(vectorizer.get_feature_names_out(), X.toarray()[0])
-            sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
-            st.subheader("Top Keywords:")
-            for word, score in sorted_scores[:15]:
-                st.write(f"- {word} ({score:.4f})")
+        # 5) Basic Visualization
+        st.header("📈 Basic Visualization")
+        st.subheader("Top 20 Most Frequent Words")
+        common = top_term_freq([w for w in words if w not in STOP_WORDS], k=20)
+        st.table(common)
 
-    # ---------------------------
-    # Semantic Analysis
-    # ---------------------------
-    with st.expander("Semantic Analysis"):
-        st.write("This finds the most semantically related sentence pairs from the Wikipedia page.")
+        st.subheader("Word Cloud")
+        draw_wordcloud([w for w in words if w not in STOP_WORDS])
 
-        if st.button("Run Semantic Analysis"):
-            doc = nlp(limited_text)
-            sentences = list(doc.sents)
+        # 6) Keyword Extraction (TF-IDF)
+        st.header("🔑 Keyword Extraction (TF-IDF)")
+        kw = keyword_extraction_tfidf(clean_wiki_markup(content), k=15)
+        st.write(", ".join(kw) if kw else "No keywords extracted.")
 
-            # Compute embeddings
-            embeddings = [sent.vector for sent in sentences]
-
-            # Similarity matrix
-            sim_matrix = cosine_similarity(embeddings)
-
-            results = []
-            for i in range(len(sentences)):
-                for j in range(i + 1, len(sentences)):
-                    results.append(((sentences[i].text, sentences[j].text), sim_matrix[i][j]))
-
-            # Sort by similarity
-            results = sorted(results, key=lambda x: x[1], reverse=True)[:5]
-
-            st.subheader("Top Semantic Similarities:")
-            for (sent_pair, score) in results:
-                st.markdown(f"**Sentence 1:** {sent_pair[0]}")
-                st.markdown(f"**Sentence 2:** {sent_pair[1]}")
-                st.write(f"**Similarity Score:** {score:.4f}")
-                st.markdown("---")
-
-    # ---------------------------
-    # Word Sense Disambiguation
-    # ---------------------------
-    with st.expander("Word Sense Disambiguation (WSD)"):
-        sentence = st.text_input("Enter a sentence from the article:", key="wsd_sentence")
-        target_word = st.text_input("Enter the target word:", key="wsd_word")
-
-        if st.button("Disambiguate Word"):
-            if sentence and target_word:
-                try:
-                    if 'simple_lesk' in globals():
-                        sense = simple_lesk(sentence, target_word, pos='n')
-                    else:
-                        sense = lesk(nltk.word_tokenize(sentence), target_word, 'n')
-
-                    if sense:
-                        st.subheader("Disambiguation Result:")
-                        st.write(f"**Word:** {target_word}")
-                        st.write(f"**Sense (Synset):** {sense.name()}")
-                        st.write(f"**Definition:** {sense.definition()}")
-                        st.write(f"**Examples:** {sense.examples()}")
-                    else:
-                        st.warning("No sense found. Try another word or sentence.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+        # 7) Word Sense Disambiguation (user-provided)
+        st.header("🔍 Word Sense Disambiguation (WSD)")
+        user_sentence = st.text_input("Enter a sentence from the page (or any sentence):", "")
+        user_word = st.text_input("Target word to disambiguate (must appear in the sentence):", "")
+        if st.button("Run WSD"):
+            if not user_sentence or not user_word:
+                st.warning("Please provide both a sentence and a target word.")
             else:
-                st.warning("Please provide both sentence and target word.")
+                res = perform_wsd(user_sentence, user_word)
+                if res:
+                    st.write(f"**Word:** {res['word']}")
+                    st.write(f"**Sense (Synset):** {res['synset']}")
+                    st.write(f"**Definition:** {res['definition']}")
+                    st.write(f"**Examples:** {res['examples']}")
+                else:
+                    st.info("No sense could be determined. Try a longer sentence containing more context.")
+        # 8) POS Tagging
+        st.header("📝 Part-of-Speech (POS) Tagging")
+        num_sent_pos = st.slider("Number of sentences to analyze (POS)", 1, 10, 3)
+        pos_results = perform_pos_tagging(clean_wiki_markup(content), num_sentences=num_sent_pos)
+        for sent, tags in pos_results:
+            st.write(f"**Sentence:** {sent}")
+            st.write(tags)
+
+        # 9) Named Entity Recognition (NER)
+        st.header("🏷️ Named Entity Recognition (NER)")
+        num_sent_ner = st.slider("Number of sentences to analyze (NER)", 1, 10, 3)
+        ner_results = perform_ner(clean_wiki_markup(content), num_sentences=num_sent_ner)
+        for sent, tree in ner_results:
+            st.write(f"**Sentence:** {sent}")
+            st.text(tree.pformat())
+
+    except Exception as e:
+        st.error(f"Error fetching or processing page: {e}")
+else:
+    st.info("Paste a Wikipedia URL to begin.")
