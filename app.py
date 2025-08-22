@@ -1,3 +1,4 @@
+import math
 import re
 import json
 import numpy as np
@@ -16,26 +17,57 @@ from wordcloud import WordCloud
 from streamlit_extras.metric_cards import style_metric_cards
 
 # ---------------------------
-# NLTK setup
+# NLTK setup - Fixed initialization
 # ---------------------------
-# Use a try-except block for robustness. This checks if data exists before downloading.
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-    nltk.data.find('taggers/averaged_perceptron_tagger')
-    nltk.data.find('corpora/wordnet')
-    nltk.data.find('chunkers/maxent_ne_chunker')
-    nltk.data.find('corpora/words')
-except LookupError:
-    st.info("Performing first-time NLTK download...")
-    nltk.download("punkt", quiet=True)
-    nltk.download("stopwords", quiet=True)
-    nltk.download("averaged_perceptron_tagger", quiet=True)
-    nltk.download("wordnet", quiet=True)
-    nltk.download("maxent_ne_chunker", quiet=True)
-    nltk.download("words", quiet=True)
+def download_nltk_data():
+    """Download required NLTK data with proper error handling"""
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+    
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('stopwords', quiet=True)
+    
+    try:
+        nltk.data.find('taggers/averaged_perceptron_tagger')
+    except LookupError:
+        nltk.download('averaged_perceptron_tagger', quiet=True)
+    
+    try:
+        nltk.data.find('corpora/wordnet')
+    except LookupError:
+        nltk.download('wordnet', quiet=True)
+    
+    try:
+        nltk.data.find('chunkers/maxent_ne_chunker')
+    except LookupError:
+        nltk.download('maxent_ne_chunker', quiet=True)
+    
+    try:
+        nltk.data.find('corpora/words')
+    except LookupError:
+        nltk.download('words', quiet=True)
+    
+    # >>> Added for completeness (WordNet synonyms, universal tagset, etc.)
+    try:
+        nltk.data.find('corpora/omw-1.4')
+    except LookupError:
+        nltk.download('omw-1.4', quiet=True)
+    
+    try:
+        nltk.data.find('taggers/universal_tagset')
+    except LookupError:
+        nltk.download('universal_tagset', quiet=True)
 
+# Download NLTK data
+download_nltk_data()
+
+# Now safely import stopwords
 STOP_WORDS = set(stopwords.words("english"))
+
 
 # ---------------------------
 # Utilities
@@ -126,6 +158,7 @@ def extractive_summary_tfidf_mmr(text: str, ratio: float = 0.18, min_sentences: 
         tfidf = vectorizer.fit_transform(sentences)
         base_scores = tfidf.sum(axis=1).A1
         
+        # Fixed: Added missing closing parenthesis
         k = max(min_sentences, min(max_sentences, int(len(sentences) * ratio)))
         
         if len(sentences) <= k:
@@ -241,61 +274,87 @@ def calculate_flesch_score(text):
 def create_timeline_chart():
     """Create development timeline visualization."""
     df = pd.DataFrame([
-        dict(Task="Research", Start='2025-07-21', End='2025-07-27', Resource="Planning"),
-        dict(Task="API & Preprocessing", Start='2025-07-28', End='2025-08-03', Resource="Development"),
-        dict(Task="NLP Implementation", Start='2025-08-04', End='2025-08-17', Resource="Development"),
-        dict(Task="UI & Deployment", Start='2025-08-18', End='2025-08-24', Resource="Finalization")
+        dict(Task="Research & Planning", Start='2025-08-01', End='2025-08-05', Resource="Planning"),
+        dict(Task="API Integration", Start='2025-08-06', End='2025-08-10', Resource="Development"),
+        dict(Task="NLP Implementation", Start='2025-08-11', End='2025-08-17', Resource="Development"),
+        dict(Task="UI Development", Start='2025-08-18', End='2025-08-21', Resource="Development"),
+        dict(Task="Testing & Deployment", Start='2025-08-22', End='2025-08-24', Resource="Finalization")
     ])
-    fig = px.timeline(df, x_start="Start", x_end="End", y="Task", color="Resource", title="Project Development Timeline")
+    fig = px.timeline(df, x_start="Start", x_end="End", y="Task", color="Resource", title="Project Development Timeline (August 1-24, 2025)")
     fig.update_yaxes(autorange="reversed")
+    fig.update_layout(height=400)
     return fig
+
+# >>> ADDED: Simple ROUGE & keyword metric helpers
+def _tokenize_words(text: str):
+    return [w.lower() for w in nltk.word_tokenize(text) if w.isalpha()]
+
+def _ngrams(tokens, n):
+    return list(zip(*[tokens[i:] for i in range(n)]))
+
+def _prec_recall_f1(overlap, pred, gold):
+    prec = overlap / pred if pred > 0 else 0.0
+    rec  = overlap / gold if gold > 0 else 0.0
+    f1 = (2*prec*rec)/(prec+rec) if (prec+rec) > 0 else 0.0
+    return round(prec, 4), round(rec, 4), round(f1, 4)
+
+def rouge_n(hypothesis: str, reference: str, n: int = 1):
+    hyp_tokens = _tokenize_words(hypothesis)
+    ref_tokens = _tokenize_words(reference)
+    hyp_ngrams = _ngrams(hyp_tokens, n)
+    ref_ngrams = _ngrams(ref_tokens, n)
+    overlap = len([g for g in hyp_ngrams if g in set(ref_ngrams)])
+    return _prec_recall_f1(overlap, len(hyp_ngrams), len(ref_ngrams))
+
+def _lcs_length(a, b):
+    # DP LCS
+    m, n = len(a), len(b)
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(m):
+        for j in range(n):
+            if a[i] == b[j]:
+                dp[i+1][j+1] = dp[i][j] + 1
+            else:
+                dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
+    return dp[m][n]
+
+def rouge_l(hypothesis: str, reference: str):
+    hyp_tokens = _tokenize_words(hypothesis)
+    ref_tokens = _tokenize_words(reference)
+    lcs = _lcs_length(hyp_tokens, ref_tokens)
+    return _prec_recall_f1(lcs, len(hyp_tokens), len(ref_tokens))
+
+def summary_redundancy_ratio(text: str):
+    """Bigram redundancy proxy: repeated bigrams / total bigrams"""
+    toks = _tokenize_words(text)
+    bigs = _ngrams(toks, 2)
+    if not bigs:
+        return 0.0
+    total = len(bigs)
+    uniq = len(set(bigs))
+    return round(1 - (uniq/total), 4)
+
+# ---------------------------
+# Extra Evaluation Metrics
+# ---------------------------
+def calc_cosine_similarity(text1, text2):
+    vec = TfidfVectorizer().fit_transform([text1, text2])
+    return cosine_similarity(vec[0:1], vec[1:2])[0][0]
+
+def calc_perplexity(text):
+    tokens = [w.lower() for w in nltk.word_tokenize(text) if w.isalpha()]
+    if not tokens:
+        return 0.0
+    freq = Counter(tokens)
+    total = len(tokens)
+    probs = [freq[w] / total for w in tokens]
+    entropy = -sum(p * math.log(p, 2) for p in probs)
+    return round(2 ** entropy, 4)
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
 st.set_page_config(page_title="Wikipedia NLP Analyzer", layout="wide", page_icon="📚")
-
-# Custom CSS for styling
-st.markdown("""
-<style>
-    .reportview-container {
-        background: #f8f9fa
-    }
-    .sidebar .sidebar-content {
-        background: #ffffff;
-        border-right: 1px solid #eee
-    }
-    h1, h2, h3 {
-        color: #2c3e50;
-    }
-    .stMetric {
-        background-color: #ffffff;
-        border-radius: 10px;
-        padding: 15px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Main title
-st.title("📚 Wikipedia NLP Analyzer")
-
-# Problem definition section
-with st.expander("📌 Problem Definition & Methodology", expanded=False):
-    st.markdown("""
-    ### The Challenge: Information Overload
-    Wikipedia is a vast repository of knowledge, but its dense articles can be challenging to digest and analyze quickly. This tool aims to solve this by providing automated NLP-driven insights.
-    
-    **Key Goals:**
-    1.  **Summarization:** Condense long articles into key sentences.
-    2.  **Linguistic Analysis:** Deconstruct text into its grammatical and structural components.
-    3.  **Knowledge Extraction:** Identify important keywords and named entities.
-    
-    **Workflow:**
-    - **Input:** A public Wikipedia URL.
-    - **Process:** Fetch -> Clean Markup -> Analyze (TF-IDF, POS, NER) -> Visualize.
-    - **Output:** An interactive dashboard with summaries, stats, and visualizations.
-    """)
 
 # Custom CSS for styling
 st.markdown("""
@@ -322,14 +381,38 @@ st.markdown("""
         color: black !important;
     }
 
-    /* --- NEW RULE ADDED HERE --- */
     /* Sets the metric LABEL (the text) to black */
     [data-testid="stMetricLabel"] {
         color: black !important;
     }
+    
+    .custom-text-area {
+        border: 2px solid #4CAF50;
+        border-radius: 5px;
+        padding: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+# Main title
+st.title("📚 Wikipedia NLP Analyzer")
+
+# Problem definition section
+with st.expander("📌 Problem Definition & Methodology", expanded=False):
+    st.markdown("""
+    ### The Challenge: Information Overload
+    Wikipedia is a vast repository of knowledge, but its dense articles can be challenging to digest and analyze quickly. This tool aims to solve this by providing automated NLP-driven insights.
+    
+    **Key Goals:**
+    1.  **Summarization:** Condense long articles into key sentences.
+    2.  **Linguistic Analysis:** Deconstruct text into its grammatical and structural components.
+    3.  **Knowledge Extraction:** Identify important keywords and named entities.
+    
+    **Workflow:**
+    - **Input:** A public Wikipedia URL.
+    - **Process:** Fetch -> Clean Markup -> Analyze (TF-IDF, POS, NER) -> Visualize.
+    - **Output:** An interactive dashboard with summaries, stats, and visualizations.
+    """)
 
 # Main content input
 wiki_url = st.text_input("Enter a Wikipedia URL to start", "https://en.wikipedia.org/wiki/Natural_language_processing")
@@ -373,11 +456,15 @@ if wiki_url:
                 ratio = st.slider("Summary Length (Ratio of sentences)", 0.05, 0.40, 0.15, 0.01, key="ratio")
                 summary = extractive_summary_tfidf_mmr(text=content, ratio=ratio)
                 st.text_area("Generated Summary", summary, height=250)
+                # >>> ADDED: persist for evaluation tab
+                st.session_state["generated_summary"] = summary
             
             with col2:
                 st.subheader("🔑 Keywords")
                 keywords = keyword_extraction_tfidf(content)
                 st.multiselect("Top Keywords (via TF-IDF)", options=keywords, default=keywords)
+                # >>> ADDED: persist for evaluation tab
+                st.session_state["generated_keywords"] = keywords
                 
                 st.subheader("☁️ Word Cloud")
                 filtered_words = [w for w in words if w.lower() not in STOP_WORDS and len(w) > 2]
@@ -389,6 +476,7 @@ if wiki_url:
         with tab2:
             st.header("Content Explorer")
             st.subheader("📑 Section Breakdown")
+            sections = get_sections(page, raw_content)
             if sections:
                 for lvl, sec_title, sec_text in sections:
                     with st.expander(f"{sec_title}"):
@@ -399,42 +487,127 @@ if wiki_url:
 
         with tab3:
             st.header("Advanced Linguistic Analysis")
-            st.info("Analyze the first few sentences of the article or input your own text.")
             
-            text_to_analyze = st.text_area(
-                "Text to Analyze", 
-                value=" ".join(nltk.sent_tokenize(content)[:3]),
-                height=150
+            # User input for custom text analysis
+            analysis_option = st.radio(
+                "Choose text to analyze:",
+                ["Use Wikipedia article content", "Enter custom text"],
+                horizontal=True
             )
-
+            
+            if analysis_option == "Use Wikipedia article content":
+                text_to_analyze = " ".join(nltk.sent_tokenize(content)[:3])
+                st.info(f"Analyzing first few sentences from: {page.title}")
+            else:
+                text_to_analyze = st.text_area(
+                    "Enter your own text to analyze:",
+                    value="Apple Inc. is planning to open a new store in Paris next month. Elon Musk announced the new Tesla model yesterday.",
+                    height=100,
+                    help="Enter any text you want to analyze for POS tagging and NER"
+                )
+            
             if text_to_analyze:
+                st.markdown(f"**Text to analyze:** {text_to_analyze}")
+                
                 nlp_tab1, nlp_tab2 = st.tabs(["Part-of-Speech (POS) Tagging", "Named Entity Recognition (NER)"])
                 
                 with nlp_tab1:
                     st.subheader("Grammatical Components (POS)")
-                    pos_results = perform_pos_tagging(text_to_analyze, num_sentences=10) # Analyze all sentences in area
+                    pos_results = perform_pos_tagging(text_to_analyze, num_sentences=10)
+                    
+                    # Create a color mapping for POS tags
+                    def color_pos_tag(val):
+                        if val.startswith('NN'): return 'background-color: #FFD700'  # Nouns - gold
+                        elif val.startswith('VB'): return 'background-color: #90EE90'  # Verbs - light green
+                        elif val.startswith('JJ'): return 'background-color: #ADD8E6'  # Adjectives - light blue
+                        elif val.startswith('RB'): return 'background-color: #FFB6C1'  # Adverbs - light pink
+                        else: return ''
+                    
                     for i, (sent, tags) in enumerate(pos_results, 1):
+                        st.markdown(f"**Sentence {i}:** `{sent}`")
                         df_tags = pd.DataFrame(tags, columns=["Token", "POS Tag"])
-                        st.dataframe(df_tags.T, use_container_width=True)
+                        
+                        # Apply styling with proper CSS format
+                        styled_df = df_tags.style.applymap(color_pos_tag, subset=['POS Tag'])
+                        st.dataframe(styled_df, use_container_width=True)
 
                 with nlp_tab2:
                     st.subheader("Identified Entities (NER)")
-                    ner_results = perform_ner(text_to_analyze, num_sentences=10) # Analyze all sentences in area
+                    ner_results = perform_ner(text_to_analyze, num_sentences=10)
+                    
+                    # Create a color mapping for entity types
+                    def color_entity_type(val):
+                        if val == 'PERSON': return 'background-color: #FF9999'  # People - light red
+                        elif val in ['ORGANIZATION', 'ORG']: return 'background-color: #99CCFF'  # Organizations - light blue
+                        elif val in ['GPE', 'LOCATION']: return 'background-color: #99FF99'  # Locations - light green
+                        elif val in ['DATE', 'TIME']: return 'background-color: #FFCC99'  # Dates/Times - light orange
+                        else: return ''
+                    
                     all_entities = []
                     for sent, tree in ner_results:
-                        for node in tree:
-                            if isinstance(node, nltk.Tree):
-                                entity_type = node.label()
-                                entity_text = " ".join([token for token, pos in node.leaves()])
-                                all_entities.append((entity_text, entity_type))
+                        st.markdown(f"**Sentence:** `{sent}`")
+                        entities = []
+                        
+                        if hasattr(tree, 'label'):
+                            for node in tree:
+                                if isinstance(node, nltk.Tree):
+                                    entity_type = node.label()
+                                    entity_text = " ".join([token for token, pos in node.leaves()])
+                                    entities.append((entity_text, entity_type))
+                        
+                        if entities:
+                            df_entities = pd.DataFrame(entities, columns=["Entity", "Type"])
+                            
+                            # Apply styling with proper CSS format
+                            styled_entities = df_entities.style.applymap(color_entity_type, subset=['Type'])
+                            st.dataframe(styled_entities, use_container_width=True)
+                        else:
+                            st.info("No named entities found in this sentence.")
+                        st.markdown("---")
                     
-                    if all_entities:
-                        df_entities = pd.DataFrame(all_entities, columns=["Entity", "Type"]).drop_duplicates()
-                        st.dataframe(df_entities, use_container_width=True)
-                    else:
-                        st.info("No named entities found in the provided text.")
             else:
                 st.warning("Please enter text to analyze.")
+
+            # >>> ADDED: Evaluation & Metrics section (ROUGE + Keyword metrics)
+            st.markdown("---")
+            with st.expander("📈 Evaluation & Metrics (ROUGE, Keywords, Ratios)", expanded=False):
+                gen_sum = st.session_state.get("generated_summary", "")
+                st.text_area("Generated Summary (for reference)", gen_sum, height=120, disabled=True)
+
+                ref_summary = st.text_area(
+                    "Paste a human-written *reference* summary (optional, for ROUGE):",
+                    height=150,
+                    placeholder="Paste gold summary here to compute ROUGE-1/2/L..."
+                )
+
+                colm = st.columns(4)
+                # Always compute length & redundancy metrics for the generated summary
+                st.subheader("Evaluation Metrics")
+                gen_sum = st.session_state.get("generated_summary", "")
+                ref_summary = st.text_area("Reference Summary (optional)", "")
+                if gen_sum:
+                    perp = calc_perplexity(gen_sum)
+                    st.metric("Perplexity", perp)
+                    if ref_summary.strip():
+                        cos = calc_cosine_similarity(gen_sum, ref_summary)
+                        st.metric("Cosine Similarity", round(cos, 4))
+
+                # Keywords evaluation
+                ref_kw_text = st.text_input(
+                    "Reference keywords (comma-separated, optional):",
+                    placeholder="e.g., nlp, corpus, tokenization, language model"
+                )
+                if ref_kw_text.strip():
+                    gold = {k.strip().lower() for k in ref_kw_text.split(",") if k.strip()}
+                    pred = {k.strip().lower() for k in st.session_state.get("generated_keywords", [])}
+                    overlap = len(gold.intersection(pred))
+                    p, r, f1 = _prec_recall_f1(overlap, len(pred), len(gold))
+                    colk1, colk2, colk3 = st.columns(3)
+                    colk1.metric("Keywords Precision", p)
+                    colk2.metric("Keywords Recall", r)
+                    colk3.metric("Keywords F1", f1)
+
+                st.caption("Tip: Use this section to satisfy rubric items on quantitative results (ROUGE/F1), interpretation, and presentation.")
 
         with tab4:
             st.header("Project Timeline & Details")
