@@ -13,8 +13,17 @@ from nltk.corpus import stopwords, wordnet as wn
 from nltk.wsd import lesk
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.decomposition import PCA
 from wordcloud import WordCloud
 from streamlit_extras.metric_cards import style_metric_cards
+import gensim
+from gensim.models import Word2Vec
+from gensim.models import KeyedVectors
+import seaborn as sns
+from io import BytesIO
+import base64
+from scipy.linalg import triu
+
 
 # ---------------------------
 # NLTK setup - Fixed initialization
@@ -51,7 +60,6 @@ def download_nltk_data():
     except LookupError:
         nltk.download('words', quiet=True)
     
-    # >>> Added for completeness (WordNet synonyms, universal tagset, etc.)
     try:
         nltk.data.find('corpora/omw-1.4')
     except LookupError:
@@ -158,7 +166,6 @@ def extractive_summary_tfidf_mmr(text: str, ratio: float = 0.18, min_sentences: 
         tfidf = vectorizer.fit_transform(sentences)
         base_scores = tfidf.sum(axis=1).A1
         
-        # Fixed: Added missing closing parenthesis
         k = max(min_sentences, min(max_sentences, int(len(sentences) * ratio)))
         
         if len(sentences) <= k:
@@ -352,6 +359,182 @@ def calc_perplexity(text):
     return round(2 ** entropy, 4)
 
 # ---------------------------
+# NEW: Information Retrieval Module
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def build_sentence_index(content):
+    """Create a search index of sentences with TF-IDF vectors."""
+    cleaned = clean_wiki_markup(content)
+    sentences = [sent_clean(s) for s in nltk.sent_tokenize(cleaned)]
+    sentences = [s for s in sentences if s and len(s.split()) >= 5]
+    
+    if not sentences:
+        return None, None, None
+    
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(sentences)
+    
+    return sentences, tfidf_matrix, vectorizer
+
+def information_retrieval_search(query, sentences, tfidf_matrix, vectorizer, top_k=5):
+    """Search for relevant sentences using TF-IDF cosine similarity."""
+    if not sentences:
+        return []
+    
+    # Transform query to TF-IDF vector
+    query_vec = vectorizer.transform([query])
+    
+    # Calculate cosine similarities
+    similarities = cosine_similarity(query_vec, tfidf_matrix).flatten()
+    
+    # Get top-k results
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    
+    results = []
+    for idx in top_indices:
+        if similarities[idx] > 0:
+            results.append({
+                "sentence": sentences[idx],
+                "similarity": similarities[idx],
+                "index": idx
+            })
+    
+    return results
+
+# ---------------------------
+# NEW: Word2Vec Module
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def train_word2vec_models(content):
+    """Train CBOW and Skip-gram models on the article content."""
+    # Tokenize the content into sentences and words
+    sentences = [nltk.word_tokenize(sent) for sent in nltk.sent_tokenize(content)]
+    
+    # Filter out short sentences and non-alphabetic tokens
+    processed_sentences = []
+    for sent in sentences:
+        filtered_sent = [word.lower() for word in sent if word.isalpha() and word.lower() not in STOP_WORDS]
+        if len(filtered_sent) > 3:  # Only include sentences with at least 4 words
+            processed_sentences.append(filtered_sent)
+    
+    if len(processed_sentences) < 5:
+        return None, None
+    
+    # Train CBOW model
+    cbow_model = Word2Vec(
+        sentences=processed_sentences,
+        vector_size=100,
+        window=5,
+        min_count=2,
+        workers=4,
+        sg=0  # 0 for CBOW, 1 for Skip-gram
+    )
+    
+    # Train Skip-gram model
+    sg_model = Word2Vec(
+        sentences=processed_sentences,
+        vector_size=100,
+        window=5,
+        min_count=2,
+        workers=4,
+        sg=1  # 1 for Skip-gram
+    )
+    
+    return cbow_model, sg_model
+
+def visualize_word_embeddings(model, words):
+    """Create a 2D visualization of word embeddings using PCA."""
+    if not model or not words:
+        return None
+    
+    # Get vectors for the words that exist in the vocabulary
+    valid_words = [word for word in words if word in model.wv.key_to_index]
+    
+    if len(valid_words) < 2:
+        return None
+    
+    # Get vectors
+    word_vectors = [model.wv[word] for word in valid_words]
+    
+    # Apply PCA for dimensionality reduction
+    pca = PCA(n_components=2)
+    vectors_2d = pca.fit_transform(word_vectors)
+    
+    # Create a DataFrame for plotting
+    df = pd.DataFrame({
+        'x': vectors_2d[:, 0],
+        'y': vectors_2d[:, 1],
+        'word': valid_words
+    })
+    
+    # Create the plot
+    plt.figure(figsize=(10, 8))
+    plt.scatter(df['x'], df['y'], alpha=0.7)
+    
+    # Add labels
+    for i, row in df.iterrows():
+        plt.annotate(row['word'], (row['x'], row['y']), fontsize=12)
+    
+    plt.title("Word Embeddings Visualization (PCA-reduced)")
+    plt.xlabel("PCA Component 1")
+    plt.ylabel("PCA Component 2")
+    plt.grid(True, alpha=0.3)
+    
+    return plt
+
+# ---------------------------
+# NEW: Methodologies & Diagrams
+# ---------------------------
+def show_methodology_diagrams():
+    """Display methodology diagrams for the project."""
+    st.subheader("Methodology & System Architecture")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        ### Text Processing Pipeline
+        ```
+        Wikipedia Content
+              ↓
+        Markup Cleaning
+              ↓
+        Sentence Tokenization
+              ↓
+        TF-IDF Vectorization
+              ↓
+        MMR-based Selection → Summary
+              ↓
+        Evaluation (ROUGE, Cosine)
+        ```
+        """)
+    
+    with col2:
+        st.markdown("""
+        ### Word2Vec Training Approaches
+        ```
+        Tokenized Text
+              ↓
+        CBOW: Predict target word from context
+              ↓
+        Skip-gram: Predict context from target word
+              ↓
+        Embedding Space → Similarity & Visualization
+        ```
+        """)
+    
+    st.markdown("""
+    ### Information Retrieval Process
+    ```
+    User Query → TF-IDF Vectorization
+                      ↓
+    Cosine Similarity with Sentence Vectors
+                      ↓
+    Ranked Results → Top-K Retrieval
+    ```
+    """)
+
+# ---------------------------
 # Streamlit UI
 # ---------------------------
 st.set_page_config(page_title="Wikipedia NLP Analyzer", layout="wide", page_icon="📚")
@@ -404,15 +587,20 @@ with st.expander("📌 Problem Definition & Methodology", expanded=False):
     Wikipedia is a vast repository of knowledge, but its dense articles can be challenging to digest and analyze quickly. This tool aims to solve this by providing automated NLP-driven insights.
     
     **Key Goals:**
-    1.  **Summarization:** Condense long articles into key sentences.
+    1.  **Summarization:** Condense long articles into key sentences using TF-IDF with MMR.
     2.  **Linguistic Analysis:** Deconstruct text into its grammatical and structural components.
     3.  **Knowledge Extraction:** Identify important keywords and named entities.
+    4.  **Information Retrieval:** Enable semantic search within articles.
+    5.  **Word Embeddings:** Train and visualize word vectors using Word2Vec.
     
     **Workflow:**
     - **Input:** A public Wikipedia URL.
-    - **Process:** Fetch -> Clean Markup -> Analyze (TF-IDF, POS, NER) -> Visualize.
+    - **Process:** Fetch → Clean Markup → Analyze (TF-IDF, POS, NER, Word2Vec) → Visualize.
     - **Output:** An interactive dashboard with summaries, stats, and visualizations.
     """)
+    
+    # Show methodology diagrams
+    show_methodology_diagrams()
 
 # Main content input
 wiki_url = st.text_input("Enter a Wikipedia URL to start", "https://en.wikipedia.org/wiki/Natural_language_processing")
@@ -427,8 +615,11 @@ if wiki_url:
     if page and raw_content:
         content = clean_wiki_markup(raw_content)
         
-        # Create tabs for organization
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "📜 Content Explorer", "🔬 Advanced Analysis", "🔄 Project Timeline"])
+        # Create tabs for organization - ADDED NEW TABS
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "📊 Dashboard", "📜 Content Explorer", "🔍 Information Retrieval", 
+            "🔤 Word Embeddings", "🔬 Advanced Analysis", "🔄 Project Timeline"
+        ])
         
         with tab1:
             st.header(f"Analysis Dashboard for: *{page.title}*")
@@ -456,14 +647,14 @@ if wiki_url:
                 ratio = st.slider("Summary Length (Ratio of sentences)", 0.05, 0.40, 0.15, 0.01, key="ratio")
                 summary = extractive_summary_tfidf_mmr(text=content, ratio=ratio)
                 st.text_area("Generated Summary", summary, height=250)
-                # >>> ADDED: persist for evaluation tab
+                # persist for evaluation tab
                 st.session_state["generated_summary"] = summary
             
             with col2:
                 st.subheader("🔑 Keywords")
                 keywords = keyword_extraction_tfidf(content)
                 st.multiselect("Top Keywords (via TF-IDF)", options=keywords, default=keywords)
-                # >>> ADDED: persist for evaluation tab
+                # persist for evaluation tab
                 st.session_state["generated_keywords"] = keywords
                 
                 st.subheader("☁️ Word Cloud")
@@ -485,7 +676,112 @@ if wiki_url:
                 st.info("No sections detected. Showing full content.")
                 st.write(content)
 
+        # NEW: Information Retrieval Tab
         with tab3:
+            st.header("🔍 Information Retrieval")
+            st.markdown("""
+            **Methodology**: This module uses TF-IDF vectorization and cosine similarity to retrieve 
+            the most relevant sentences from the article based on your query.
+            """)
+            
+            # Build the sentence index
+            sentences, tfidf_matrix, vectorizer = build_sentence_index(content)
+            
+            if sentences:
+                # Query input
+                query = st.text_input("Enter your search query:", "machine learning")
+                top_k = st.slider("Number of results to show:", 3, 10, 5)
+                
+                if st.button("Search"):
+                    with st.spinner("Searching for relevant content..."):
+                        results = information_retrieval_search(query, sentences, tfidf_matrix, vectorizer, top_k)
+                    
+                    if results:
+                        st.subheader(f"Top {len(results)} Results")
+                        
+                        # Display results with similarity scores
+                        for i, result in enumerate(results):
+                            with st.expander(f"Result #{i+1} (Similarity: {result['similarity']:.3f})"):
+                                st.write(result['sentence'])
+                        
+                        # Show evaluation metrics
+                        st.subheader("Retrieval Evaluation")
+                        avg_similarity = np.mean([r['similarity'] for r in results])
+                        st.metric("Average Similarity Score", f"{avg_similarity:.3f}")
+                        
+                        # Show distribution of similarity scores
+                        fig, ax = plt.subplots(figsize=(8, 4))
+                        similarities = [r['similarity'] for r in results]
+                        ax.bar(range(1, len(similarities)+1), similarities)
+                        ax.set_xlabel("Result Rank")
+                        ax.set_ylabel("Cosine Similarity")
+                        ax.set_title("Similarity Scores by Result Rank")
+                        st.pyplot(fig)
+                    else:
+                        st.warning("No relevant results found. Try a different query.")
+            else:
+                st.warning("Not enough content to build a search index.")
+
+        # NEW: Word Embeddings Tab
+        with tab4:
+            st.header("🔤 Word Embeddings (Word2Vec)")
+            st.markdown("""
+            **Methodology**: This module trains Word2Vec models (CBOW and Skip-gram) on the article text 
+            to learn word embeddings that capture semantic relationships between words.
+            """)
+            
+            # Train Word2Vec models
+            with st.spinner("Training Word2Vec models (this may take a moment)..."):
+                cbow_model, sg_model = train_word2vec_models(content)
+            
+            if cbow_model and sg_model:
+                st.success("Models trained successfully!")
+                
+                # Model selection
+                model_choice = st.radio("Select Word2Vec model:", ["CBOW", "Skip-gram"])
+                selected_model = cbow_model if model_choice == "CBOW" else sg_model
+                
+                # Word input for similarity search
+                word = st.text_input("Enter a word to find similar words:", "language")
+                
+                if word and word in selected_model.wv.key_to_index:
+                    # Find similar words
+                    similar_words = selected_model.wv.most_similar(word, topn=10)
+                    
+                    st.subheader(f"Words Similar to '{word}'")
+                    similar_df = pd.DataFrame(similar_words, columns=["Word", "Similarity"])
+                    st.dataframe(similar_df.style.format({"Similarity": "{:.3f}"}))
+                    
+                    # Visualization
+                    st.subheader("Embedding Space Visualization")
+                    words_to_plot = [word] + [w for w, _ in similar_words[:5]]
+                    
+                    fig = visualize_word_embeddings(selected_model, words_to_plot)
+                    if fig:
+                        st.pyplot(fig)
+                    else:
+                        st.warning("Could not generate visualization for these words.")
+                    
+                    # Explanation of results
+                    with st.expander("Interpretation of Results"):
+                        st.markdown(f"""
+                        The Word2Vec {model_choice} model has learned semantic relationships between words 
+                        in the article. Words that appear in similar contexts have similar vector representations.
+                        
+                        For the word **'{word}'**, the most similar words are:
+                        - **{similar_words[0][0]}** (similarity: {similar_words[0][1]:.3f})
+                        - **{similar_words[1][0]}** (similarity: {similar_words[1][1]:.3f})
+                        - **{similar_words[2][0]}** (similarity: {similar_words[2][1]:.3f})
+                        
+                        These similarities suggest that these words often appear in similar contexts 
+                        within the article, indicating semantic relatedness.
+                        """)
+                else:
+                    st.warning(f"Word '{word}' not found in the vocabulary. Try another word.")
+            else:
+                st.warning("Not enough content to train Word2Vec models. The article might be too short.")
+
+        with tab5:
             st.header("Advanced Linguistic Analysis")
             
             # User input for custom text analysis
@@ -568,7 +864,7 @@ if wiki_url:
             else:
                 st.warning("Please enter text to analyze.")
 
-            # >>> ADDED: Evaluation & Metrics section (ROUGE + Keyword metrics)
+            # Evaluation & Metrics section
             st.markdown("---")
             with st.expander("📈 Evaluation & Metrics (ROUGE, Keywords, Ratios)", expanded=False):
                 gen_sum = st.session_state.get("generated_summary", "")
@@ -609,7 +905,7 @@ if wiki_url:
 
                 st.caption("Tip: Use this section to satisfy rubric items on quantitative results (ROUGE/F1), interpretation, and presentation.")
 
-        with tab4:
+        with tab6:
             st.header("Project Timeline & Details")
             st.plotly_chart(create_timeline_chart(), use_container_width=True)
             
@@ -621,6 +917,8 @@ if wiki_url:
               - **Solution:** Implemented Maximal Marginal Relevance (MMR) to promote diversity.
             - **Challenge:** Slow performance on large articles.
               - **Solution:** Used Streamlit's `@st.cache_data` to cache expensive computations.
+            - **Challenge:** Training Word2Vec on short articles.
+              - **Solution:** Implemented fallbacks and validations for insufficient content.
             """)
             
             st.subheader("Limitations")
@@ -628,6 +926,17 @@ if wiki_url:
             - This tool is optimized for **English** language articles.
             - The NLP models (POS, NER) are pre-trained and may have lower accuracy on highly specialized or novel topics.
             - The summary is **extractive**, meaning it selects sentences, and may not be as coherent as a human-written summary.
+            - Word2Vec models trained on single articles have limited vocabulary and context.
+            - Information retrieval is based on TF-IDF which may not capture semantic meaning as well as modern transformers.
+            """)
+            
+            st.subheader("Tool & Library Justifications")
+            st.markdown("""
+            - **NLTK**: Comprehensive NLP toolkit with robust implementations of standard algorithms
+            - **Scikit-learn**: Industry-standard machine learning library with efficient TF-IDF implementation
+            - **Gensim**: Specialized library for topic modeling and word embeddings
+            - **Streamlit**: Enables rapid development of interactive web applications for data science
+            - **Plotly/Matplotlib**: Provide rich, interactive visualizations for data exploration
             """)
             
         # --- SIDEBAR ---
@@ -651,7 +960,7 @@ if wiki_url:
             mime="application/json"
         )
         st.sidebar.markdown("---")
-        st.sidebar.info("This app uses NLTK and Scikit-learn for NLP tasks. UI built with Streamlit.")
+        st.sidebar.info("This app uses NLTK, Scikit-learn, and Gensim for NLP tasks. UI built with Streamlit.")
 
 else:
     st.info("Please enter a Wikipedia URL above to begin the analysis.")
