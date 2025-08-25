@@ -1,88 +1,76 @@
+# app.py (Python 3.13 compatible; no gensim/scipy)
+
 import math
 import re
 import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from collections import Counter
+from collections import Counter, defaultdict
 import plotly.express as px
 import streamlit as st
 import wikipedia
 import nltk
 from nltk.corpus import stopwords, wordnet as wn
 from nltk.wsd import lesk
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
 from wordcloud import WordCloud
-from streamlit_extras.metric_cards import style_metric_cards
-import gensim
-from gensim.models import Word2Vec
-from gensim.models import KeyedVectors
-import seaborn as sns
-from io import BytesIO
-import base64
-from scipy.linalg import triu
 
+# Try to import optional metric card styling (won't break if missing)
+try:
+    from streamlit_extras.metric_cards import style_metric_cards
+except Exception:
+    def style_metric_cards():
+        pass
 
 # ---------------------------
-# NLTK setup - Fixed initialization
+# spaCy setup for POS/NER (with safe auto-download)
+# ---------------------------
+import importlib
+try:
+    import spacy  # noqa
+    try:
+        nlp_spacy = spacy.load("en_core_web_sm")
+    except OSError:
+        # Auto-download the small English model if not available
+        from spacy.cli import download as spacy_download
+        spacy_download("en_core_web_sm")
+        nlp_spacy = spacy.load("en_core_web_sm")
+except Exception:
+    nlp_spacy = None  # If spaCy truly unavailable, we handle gracefully later
+
+# ---------------------------
+# NLTK setup - Fixed initialization (quiet & robust)
 # ---------------------------
 def download_nltk_data():
-    """Download required NLTK data with proper error handling"""
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-    
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords', quiet=True)
-    
-    try:
-        nltk.data.find('taggers/averaged_perceptron_tagger')
-    except LookupError:
-        nltk.download('averaged_perceptron_tagger', quiet=True)
-    
-    try:
-        nltk.data.find('corpora/wordnet')
-    except LookupError:
-        nltk.download('wordnet', quiet=True)
-    
-    try:
-        nltk.data.find('chunkers/maxent_ne_chunker')
-    except LookupError:
-        nltk.download('maxent_ne_chunker', quiet=True)
-    
-    try:
-        nltk.data.find('corpora/words')
-    except LookupError:
-        nltk.download('words', quiet=True)
-    
-    try:
-        nltk.data.find('corpora/omw-1.4')
-    except LookupError:
-        nltk.download('omw-1.4', quiet=True)
-    
-    try:
-        nltk.data.find('taggers/universal_tagset')
-    except LookupError:
-        nltk.download('universal_tagset', quiet=True)
+    """Download required NLTK data with proper error handling."""
+    need = [
+        ("tokenizers/punkt", "punkt"),
+        ("corpora/stopwords", "stopwords"),
+        ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+        ("corpora/wordnet", "wordnet"),
+        ("chunkers/maxent_ne_chunker", "maxent_ne_chunker"),
+        ("corpora/words", "words"),
+        ("corpora/omw-1.4", "omw-1.4"),
+        ("taggers/universal_tagset", "universal_tagset"),
+    ]
+    for path, pkg in need:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            nltk.download(pkg, quiet=True)
 
-# Download NLTK data
 download_nltk_data()
-
-# Now safely import stopwords
 STOP_WORDS = set(stopwords.words("english"))
-
 
 # ---------------------------
 # Utilities
 # ---------------------------
 @st.cache_data(ttl=3600)
 def get_wiki_content(title):
-    """Cached function to fetch Wikipedia content"""
+    """Cached function to fetch Wikipedia content."""
     try:
         page = wikipedia.page(title, auto_suggest=False, redirect=True)
         return page, page.content
@@ -112,20 +100,16 @@ def parse_sections_from_content(content: str):
     """Parse sections using Wikipedia-style headings."""
     if not content:
         return []
-
     pattern = re.compile(r"(?m)^(={2,6})\s*(.+?)\s*\1\s*$")
     matches = list(pattern.finditer(content))
-
     sections = []
     if not matches:
         sections.append((2, "Introduction", content.strip()))
         return sections
-
     if matches[0].start() > 0:
         intro_text = content[:matches[0].start()].strip()
         if intro_text:
             sections.append((2, "Introduction", intro_text))
-
     for i, m in enumerate(matches):
         level = len(m.group(1))
         title = m.group(2).strip()
@@ -133,7 +117,6 @@ def parse_sections_from_content(content: str):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
         body = content[start:end].strip()
         sections.append((level, title, body))
-
     seen = set()
     return [(lvl, t, txt) for lvl, t, txt in sections if not (t.lower() in seen or seen.add(t.lower()))]
 
@@ -157,37 +140,29 @@ def extractive_summary_tfidf_mmr(text: str, ratio: float = 0.18, min_sentences: 
     cleaned = clean_wiki_markup(text)
     sentences = [sent_clean(s) for s in nltk.sent_tokenize(cleaned)]
     sentences = [s for s in sentences if s and len(s.split()) >= 8]
-
     if not sentences:
         return ""
-
     try:
         vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_df=0.85, min_df=2)
         tfidf = vectorizer.fit_transform(sentences)
         base_scores = tfidf.sum(axis=1).A1
-        
         k = max(min_sentences, min(max_sentences, int(len(sentences) * ratio)))
-        
         if len(sentences) <= k:
             return " ".join(sentences)
-
         sim_matrix = cosine_similarity(tfidf)
         selected = []
         candidates = list(range(len(sentences)))
         first = max(candidates, key=lambda i: base_scores[i])
         selected.append(first)
         candidates.remove(first)
-
         while len(selected) < k and candidates:
             def mmr_score(i):
                 relevance = base_scores[i]
                 diversity = max(sim_matrix[i][j] for j in selected) if selected else 0.0
                 return mmr_lambda * relevance - (1 - mmr_lambda) * diversity
-
             nxt = max(candidates, key=mmr_score)
             selected.append(nxt)
             candidates.remove(nxt)
-
         selected.sort()
         return " ".join(sentences[i] for i in selected)
     except ValueError:
@@ -211,19 +186,15 @@ def draw_wordcloud(words):
     ax.axis("off")
     st.pyplot(fig, use_container_width=True)
 
-def top_term_freq(words, k=20):
-    """Return top k frequent terms."""
-    return Counter(words).most_common(k)
-
 @st.cache_data(show_spinner=False)
 def keyword_extraction_tfidf(content: str, k: int = 15):
     """Extract keywords using TF-IDF."""
     vec = TfidfVectorizer(stop_words="english", max_features=k)
-    X = vec.fit_transform([content])
+    _ = vec.fit_transform([content])
     return list(vec.get_feature_names_out())
 
 def perform_wsd(sentence: str, word: str):
-    """Perform Word Sense Disambiguation."""
+    """Perform Word Sense Disambiguation (Lesk)."""
     sense = lesk(nltk.word_tokenize(sentence), word)
     if sense:
         return {
@@ -234,38 +205,20 @@ def perform_wsd(sentence: str, word: str):
         }
     return None
 
-def perform_pos_tagging(text: str, num_sentences: int = 5):
-    """Return POS tags for first N sentences."""
-    sentences = nltk.sent_tokenize(text)
-    return [(sent, nltk.pos_tag(nltk.word_tokenize(sent))) for sent in sentences[:num_sentences]]
-
-def perform_ner(text: str, num_sentences: int = 5):
-    """Return NER chunks for first N sentences."""
-    sentences = nltk.sent_tokenize(text)
-    ner_results = []
-    for sent in sentences[:num_sentences]:
-        tokens = nltk.word_tokenize(sent)
-        pos_tags = nltk.pos_tag(tokens)
-        chunks = nltk.ne_chunk(pos_tags, binary=False)
-        ner_results.append((sent, chunks))
-    return ner_results
-
 def calculate_flesch_score(text):
-    """Calculate readability score."""
+    """Calculate readability score (Flesch Reading Ease)."""
     sentences = nltk.sent_tokenize(text)
     if not sentences:
         return 0.0
     words = [w for s in sentences for w in nltk.word_tokenize(s) if w.isalpha()]
     if not words:
         return 0.0
-    
     syllable_count = 0
     for word in words:
-        # A simple heuristic for syllable counting
         word = word.lower()
         count = 0
         vowels = "aeiouy"
-        if word[0] in vowels:
+        if word and word[0] in vowels:
             count += 1
         for index in range(1, len(word)):
             if word[index] in vowels and word[index - 1] not in vowels:
@@ -275,7 +228,6 @@ def calculate_flesch_score(text):
         if count == 0:
             count += 1
         syllable_count += count
-        
     return round(206.835 - 1.015*(len(words)/len(sentences)) - 84.6*(syllable_count/len(words)), 1)
 
 def create_timeline_chart():
@@ -287,12 +239,13 @@ def create_timeline_chart():
         dict(Task="UI Development", Start='2025-08-18', End='2025-08-21', Resource="Development"),
         dict(Task="Testing & Deployment", Start='2025-08-22', End='2025-08-24', Resource="Finalization")
     ])
-    fig = px.timeline(df, x_start="Start", x_end="End", y="Task", color="Resource", title="Project Development Timeline (August 1-24, 2025)")
+    fig = px.timeline(df, x_start="Start", x_end="End", y="Task", color="Resource",
+                      title="Project Development Timeline (August 1-24, 2025)")
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(height=400)
     return fig
 
-# >>> ADDED: Simple ROUGE & keyword metric helpers
+# >>> ROUGE & metrics helpers
 def _tokenize_words(text: str):
     return [w.lower() for w in nltk.word_tokenize(text) if w.isalpha()]
 
@@ -314,7 +267,6 @@ def rouge_n(hypothesis: str, reference: str, n: int = 1):
     return _prec_recall_f1(overlap, len(hyp_ngrams), len(ref_ngrams))
 
 def _lcs_length(a, b):
-    # DP LCS
     m, n = len(a), len(b)
     dp = [[0]*(n+1) for _ in range(m+1)]
     for i in range(m):
@@ -341,9 +293,6 @@ def summary_redundancy_ratio(text: str):
     uniq = len(set(bigs))
     return round(1 - (uniq/total), 4)
 
-# ---------------------------
-# Extra Evaluation Metrics
-# ---------------------------
 def calc_cosine_similarity(text1, text2):
     vec = TfidfVectorizer().fit_transform([text1, text2])
     return cosine_similarity(vec[0:1], vec[1:2])[0][0]
@@ -359,7 +308,7 @@ def calc_perplexity(text):
     return round(2 ** entropy, 4)
 
 # ---------------------------
-# NEW: Information Retrieval Module
+# Information Retrieval
 # ---------------------------
 @st.cache_data(show_spinner=False)
 def build_sentence_index(content):
@@ -367,130 +316,126 @@ def build_sentence_index(content):
     cleaned = clean_wiki_markup(content)
     sentences = [sent_clean(s) for s in nltk.sent_tokenize(cleaned)]
     sentences = [s for s in sentences if s and len(s.split()) >= 5]
-    
     if not sentences:
         return None, None, None
-    
     vectorizer = TfidfVectorizer(stop_words="english")
     tfidf_matrix = vectorizer.fit_transform(sentences)
-    
     return sentences, tfidf_matrix, vectorizer
 
 def information_retrieval_search(query, sentences, tfidf_matrix, vectorizer, top_k=5):
     """Search for relevant sentences using TF-IDF cosine similarity."""
     if not sentences:
         return []
-    
-    # Transform query to TF-IDF vector
     query_vec = vectorizer.transform([query])
-    
-    # Calculate cosine similarities
     similarities = cosine_similarity(query_vec, tfidf_matrix).flatten()
-    
-    # Get top-k results
     top_indices = similarities.argsort()[-top_k:][::-1]
-    
     results = []
     for idx in top_indices:
         if similarities[idx] > 0:
             results.append({
                 "sentence": sentences[idx],
-                "similarity": similarities[idx],
-                "index": idx
+                "similarity": float(similarities[idx]),
+                "index": int(idx),
             })
-    
     return results
 
 # ---------------------------
-# NEW: Word2Vec Module
+# Co-occurrence Embeddings (replacement for Word2Vec)
 # ---------------------------
 @st.cache_data(show_spinner=False)
-def train_word2vec_models(content):
-    """Train CBOW and Skip-gram models on the article content."""
-    # Tokenize the content into sentences and words
-    sentences = [nltk.word_tokenize(sent) for sent in nltk.sent_tokenize(content)]
-    
-    # Filter out short sentences and non-alphabetic tokens
-    processed_sentences = []
-    for sent in sentences:
-        filtered_sent = [word.lower() for word in sent if word.isalpha() and word.lower() not in STOP_WORDS]
-        if len(filtered_sent) > 3:  # Only include sentences with at least 4 words
-            processed_sentences.append(filtered_sent)
-    
-    if len(processed_sentences) < 5:
-        return None, None
-    
-    # Train CBOW model
-    cbow_model = Word2Vec(
-        sentences=processed_sentences,
-        vector_size=100,
-        window=5,
-        min_count=2,
-        workers=4,
-        sg=0  # 0 for CBOW, 1 for Skip-gram
-    )
-    
-    # Train Skip-gram model
-    sg_model = Word2Vec(
-        sentences=processed_sentences,
-        vector_size=100,
-        window=5,
-        min_count=2,
-        workers=4,
-        sg=1  # 1 for Skip-gram
-    )
-    
-    return cbow_model, sg_model
+def build_cooccurrence_embeddings(content, window_size=4, min_freq=2, max_vocab=5000):
+    """
+    Build simple word co-occurrence vectors:
+      1) tokenize text into words
+      2) build a co-occurrence matrix within a sliding window
+      3) return a term->vector mapping (rows of the co-occurrence matrix)
+    """
+    # Tokenize sentences & words
+    sents = [nltk.word_tokenize(s) for s in nltk.sent_tokenize(content)]
+    tokens = []
+    for s in sents:
+        toks = [w.lower() for w in s if w.isalpha() and w.lower() not in STOP_WORDS]
+        if toks:
+            tokens.extend(toks)
 
-def visualize_word_embeddings(model, words):
-    """Create a 2D visualization of word embeddings using PCA."""
-    if not model or not words:
+    if len(tokens) < 100:
+        return {}, None  # not enough context
+
+    # Build vocabulary by frequency
+    freq = Counter(tokens)
+    vocab = [w for w, c in freq.most_common(max_vocab) if c >= min_freq]
+    if len(vocab) < 10:
+        return {}, None
+
+    index = {w: i for i, w in enumerate(vocab)}
+    V = len(vocab)
+    # Use an efficient sparse-like build (but with numpy since V is capped)
+    mat = np.zeros((V, V), dtype=np.float32)
+
+    # Sliding window co-occurrence
+    for i, w in enumerate(tokens):
+        if w not in index:
+            continue
+        wi = index[w]
+        start = max(0, i - window_size)
+        end = min(len(tokens), i + window_size + 1)
+        for j in range(start, end):
+            if j == i:
+                continue
+            c = tokens[j]
+            if c in index:
+                cj = index[c]
+                mat[wi, cj] += 1.0
+
+    # Row-normalize (to mitigate frequency effects)
+    row_sums = mat.sum(axis=1, keepdims=True) + 1e-9
+    mat = mat / row_sums
+
+    # Term -> vector
+    term_vectors = {w: mat[index[w]] for w in vocab}
+    return term_vectors, vocab
+
+def most_similar_terms(term_vectors, target, topn=10):
+    """Find most similar terms to target using cosine similarity."""
+    target = target.lower()
+    if target not in term_vectors:
+        return []
+    tv = term_vectors[target].reshape(1, -1)
+    sims = []
+    for w, v in term_vectors.items():
+        if w == target:
+            continue
+        sim = float(cosine_similarity(tv, v.reshape(1, -1))[0][0])
+        sims.append((w, sim))
+    sims.sort(key=lambda x: x[1], reverse=True)
+    return sims[:topn]
+
+def visualize_term_embeddings(term_vectors, words):
+    """PCA 2D projection of selected word vectors."""
+    valid = [w for w in words if w in term_vectors]
+    if len(valid) < 2:
         return None
-    
-    # Get vectors for the words that exist in the vocabulary
-    valid_words = [word for word in words if word in model.wv.key_to_index]
-    
-    if len(valid_words) < 2:
-        return None
-    
-    # Get vectors
-    word_vectors = [model.wv[word] for word in valid_words]
-    
-    # Apply PCA for dimensionality reduction
+    X = np.stack([term_vectors[w] for w in valid], axis=0)
     pca = PCA(n_components=2)
-    vectors_2d = pca.fit_transform(word_vectors)
-    
-    # Create a DataFrame for plotting
-    df = pd.DataFrame({
-        'x': vectors_2d[:, 0],
-        'y': vectors_2d[:, 1],
-        'word': valid_words
-    })
-    
-    # Create the plot
+    pts = pca.fit_transform(X)
+    df = pd.DataFrame({"x": pts[:, 0], "y": pts[:, 1], "word": valid})
     plt.figure(figsize=(10, 8))
-    plt.scatter(df['x'], df['y'], alpha=0.7)
-    
-    # Add labels
-    for i, row in df.iterrows():
-        plt.annotate(row['word'], (row['x'], row['y']), fontsize=12)
-    
-    plt.title("Word Embeddings Visualization (PCA-reduced)")
-    plt.xlabel("PCA Component 1")
-    plt.ylabel("PCA Component 2")
+    plt.scatter(df["x"], df["y"], alpha=0.7)
+    for _, r in df.iterrows():
+        plt.annotate(r["word"], (r["x"], r["y"]), fontsize=12)
+    plt.title("Co-occurrence Embeddings (PCA)")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
     plt.grid(True, alpha=0.3)
-    
     return plt
 
 # ---------------------------
-# NEW: Methodologies & Diagrams
+# Methodology & Diagrams
 # ---------------------------
 def show_methodology_diagrams():
     """Display methodology diagrams for the project."""
     st.subheader("Methodology & System Architecture")
-    
     col1, col2 = st.columns(2)
-    
     with col1:
         st.markdown("""
         ### Text Processing Pipeline
@@ -508,21 +453,19 @@ def show_methodology_diagrams():
         Evaluation (ROUGE, Cosine)
         ```
         """)
-    
     with col2:
         st.markdown("""
-        ### Word2Vec Training Approaches
+        ### Embeddings (Co-occurrence)
         ```
         Tokenized Text
               ↓
-        CBOW: Predict target word from context
+        Sliding Window Co-occurrence
               ↓
-        Skip-gram: Predict context from target word
+        Row-normalized Term Vectors
               ↓
-        Embedding Space → Similarity & Visualization
+        Similarity & PCA Visualization
         ```
         """)
-    
     st.markdown("""
     ### Information Retrieval Process
     ```
@@ -542,38 +485,16 @@ st.set_page_config(page_title="Wikipedia NLP Analyzer", layout="wide", page_icon
 # Custom CSS for styling
 st.markdown("""
 <style>
-    .reportview-container {
-        background: #f8f9fa
-    }
-    .sidebar .sidebar-content {
-        background: #ffffff;
-        border-right: 1px solid #eee
-    }
-    h1, h2, h3 {
-        color: #2c3e50;
-    }
+    .reportview-container { background: #f8f9fa }
+    .sidebar .sidebar-content { background: #ffffff; border-right: 1px solid #eee }
+    h1, h2, h3 { color: #2c3e50; }
     .stMetric {
-        background-color: #ffffff;
-        border-radius: 10px;
-        padding: 15px;
+        background-color: #ffffff; border-radius: 10px; padding: 15px;
         box-shadow: 0 2px 5px rgba(0,0,0,0.1);
     }
-    
-    /* Sets the metric VALUE (the number) to black */
-    [data-testid="stMetricValue"] {
-        color: black !important;
-    }
-
-    /* Sets the metric LABEL (the text) to black */
-    [data-testid="stMetricLabel"] {
-        color: black !important;
-    }
-    
-    .custom-text-area {
-        border: 2px solid #4CAF50;
-        border-radius: 5px;
-        padding: 10px;
-    }
+    [data-testid="stMetricValue"] { color: black !important; }
+    [data-testid="stMetricLabel"] { color: black !important; }
+    .custom-text-area { border: 2px solid #4CAF50; border-radius: 5px; padding: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -585,21 +506,19 @@ with st.expander("📌 Problem Definition & Methodology", expanded=False):
     st.markdown("""
     ### The Challenge: Information Overload
     Wikipedia is a vast repository of knowledge, but its dense articles can be challenging to digest and analyze quickly. This tool aims to solve this by providing automated NLP-driven insights.
-    
+
     **Key Goals:**
     1.  **Summarization:** Condense long articles into key sentences using TF-IDF with MMR.
     2.  **Linguistic Analysis:** Deconstruct text into its grammatical and structural components.
     3.  **Knowledge Extraction:** Identify important keywords and named entities.
     4.  **Information Retrieval:** Enable semantic search within articles.
-    5.  **Word Embeddings:** Train and visualize word vectors using Word2Vec.
-    
+    5.  **Embeddings:** Learn simple word vectors via co-occurrence (Python 3.13 friendly).
+
     **Workflow:**
     - **Input:** A public Wikipedia URL.
-    - **Process:** Fetch → Clean Markup → Analyze (TF-IDF, POS, NER, Word2Vec) → Visualize.
+    - **Process:** Fetch → Clean Markup → Analyze (TF-IDF, POS/NER, Co-occurrence) → Visualize.
     - **Output:** An interactive dashboard with summaries, stats, and visualizations.
     """)
-    
-    # Show methodology diagrams
     show_methodology_diagrams()
 
 # Main content input
@@ -608,38 +527,39 @@ wiki_url = st.text_input("Enter a Wikipedia URL to start", "https://en.wikipedia
 if wiki_url:
     raw_title = wiki_url.strip().split("/")[-1]
     title = re.sub(r"_", " ", raw_title)
-    
+
     with st.spinner(f"Analyzing '{title}'..."):
         page, raw_content = get_wiki_content(title)
 
     if page and raw_content:
         content = clean_wiki_markup(raw_content)
-        
-        # Create tabs for organization - ADDED NEW TABS
+
+        # Tabs
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "📊 Dashboard", "📜 Content Explorer", "🔍 Information Retrieval", 
-            "🔤 Word Embeddings", "🔬 Advanced Analysis", "🔄 Project Timeline"
+            "📊 Dashboard", "📜 Content Explorer", "🔍 Information Retrieval",
+            "🔤 Embeddings (Co-occurrence)", "🔬 Advanced Analysis", "🔄 Project Timeline"
         ])
-        
+
         with tab1:
             st.header(f"Analysis Dashboard for: *{page.title}*")
-            
+
             # --- METRICS ---
             st.subheader("Key Metrics")
             wc, uw, rt, words = page_stats(content)
             sections = get_sections(page, raw_content)
             readability_score = calculate_flesch_score(content)
-            
+
             cols = st.columns(5)
             cols[0].metric("Word Count", f"{wc:,}")
             cols[1].metric("Unique Words", f"{uw:,}")
             cols[2].metric("Read Time (mins)", f"~{rt}")
             cols[3].metric("Sections", len(sections))
-            cols[4].metric("Readability Score", f"{readability_score}", help="Flesch Reading Ease: 90-100 (Very Easy), 60-70 (Plain English), 0-30 (Very Confusing)")
+            cols[4].metric("Readability Score", f"{readability_score}",
+                           help="Flesch Reading Ease: 90-100 (Very Easy), 60-70 (Plain English), 0-30 (Very Confusing)")
             style_metric_cards()
-            
+
             st.markdown("---")
-            
+
             # --- SUMMARY & KEYWORDS ---
             col1, col2 = st.columns([2, 1])
             with col1:
@@ -647,16 +567,14 @@ if wiki_url:
                 ratio = st.slider("Summary Length (Ratio of sentences)", 0.05, 0.40, 0.15, 0.01, key="ratio")
                 summary = extractive_summary_tfidf_mmr(text=content, ratio=ratio)
                 st.text_area("Generated Summary", summary, height=250)
-                # persist for evaluation tab
                 st.session_state["generated_summary"] = summary
-            
+
             with col2:
                 st.subheader("🔑 Keywords")
                 keywords = keyword_extraction_tfidf(content)
                 st.multiselect("Top Keywords (via TF-IDF)", options=keywords, default=keywords)
-                # persist for evaluation tab
                 st.session_state["generated_keywords"] = keywords
-                
+
                 st.subheader("☁️ Word Cloud")
                 filtered_words = [w for w in words if w.lower() not in STOP_WORDS and len(w) > 2]
                 if filtered_words:
@@ -676,40 +594,27 @@ if wiki_url:
                 st.info("No sections detected. Showing full content.")
                 st.write(content)
 
-        # NEW: Information Retrieval Tab
         with tab3:
             st.header("🔍 Information Retrieval")
             st.markdown("""
             **Methodology**: This module uses TF-IDF vectorization and cosine similarity to retrieve 
             the most relevant sentences from the article based on your query.
             """)
-            
-            # Build the sentence index
             sentences, tfidf_matrix, vectorizer = build_sentence_index(content)
-            
             if sentences:
-                # Query input
                 query = st.text_input("Enter your search query:", "machine learning")
                 top_k = st.slider("Number of results to show:", 3, 10, 5)
-                
                 if st.button("Search"):
                     with st.spinner("Searching for relevant content..."):
                         results = information_retrieval_search(query, sentences, tfidf_matrix, vectorizer, top_k)
-                    
                     if results:
                         st.subheader(f"Top {len(results)} Results")
-                        
-                        # Display results with similarity scores
                         for i, result in enumerate(results):
                             with st.expander(f"Result #{i+1} (Similarity: {result['similarity']:.3f})"):
                                 st.write(result['sentence'])
-                        
-                        # Show evaluation metrics
                         st.subheader("Retrieval Evaluation")
-                        avg_similarity = np.mean([r['similarity'] for r in results])
+                        avg_similarity = float(np.mean([r['similarity'] for r in results]))
                         st.metric("Average Similarity Score", f"{avg_similarity:.3f}")
-                        
-                        # Show distribution of similarity scores
                         fig, ax = plt.subplots(figsize=(8, 4))
                         similarities = [r['similarity'] for r in results]
                         ax.bar(range(1, len(similarities)+1), similarities)
@@ -722,75 +627,48 @@ if wiki_url:
             else:
                 st.warning("Not enough content to build a search index.")
 
-        # NEW: Word Embeddings Tab
         with tab4:
-            st.header("🔤 Word Embeddings (Word2Vec)")
+            st.header("🔤 Embeddings (Co-occurrence)")
             st.markdown("""
-            **Methodology**: This module trains Word2Vec models (CBOW and Skip-gram) on the article text 
-            to learn word embeddings that capture semantic relationships between words.
+            **Methodology**: A simple, Python-3.13-friendly alternative to Word2Vec.
+            We build a word co-occurrence matrix using a sliding window, normalize rows to get vectors, 
+            then use cosine similarity + PCA to explore related words and visualize them.
             """)
-            
-            # Train Word2Vec models
-            with st.spinner("Training Word2Vec models (this may take a moment)..."):
-                cbow_model, sg_model = train_word2vec_models(content)
-            
-            if cbow_model and sg_model:
-                st.success("Models trained successfully!")
-                
-                # Model selection
-                model_choice = st.radio("Select Word2Vec model:", ["CBOW", "Skip-gram"])
-                selected_model = cbow_model if model_choice == "CBOW" else sg_model
-                
-                # Word input for similarity search
+            with st.spinner("Building co-occurrence embeddings..."):
+                term_vectors, vocab = build_cooccurrence_embeddings(content, window_size=4, min_freq=2, max_vocab=4000)
+
+            if term_vectors:
+                st.success(f"Vocabulary size: {len(term_vectors):,}")
                 word = st.text_input("Enter a word to find similar words:", "language")
-                
-                if word and word in selected_model.wv.key_to_index:
-                    # Find similar words
-                    similar_words = selected_model.wv.most_similar(word, topn=10)
-                    
-                    st.subheader(f"Words Similar to '{word}'")
-                    similar_df = pd.DataFrame(similar_words, columns=["Word", "Similarity"])
-                    st.dataframe(similar_df.style.format({"Similarity": "{:.3f}"}))
-                    
-                    # Visualization
-                    st.subheader("Embedding Space Visualization")
-                    words_to_plot = [word] + [w for w, _ in similar_words[:5]]
-                    
-                    fig = visualize_word_embeddings(selected_model, words_to_plot)
-                    if fig:
-                        st.pyplot(fig)
+                if word:
+                    sims = most_similar_terms(term_vectors, word, topn=10)
+                    if sims:
+                        st.subheader(f"Words similar to '{word}'")
+                        df_sims = pd.DataFrame(sims, columns=["Word", "Similarity"])
+                        st.dataframe(df_sims.style.format({"Similarity": "{:.3f}"}), use_container_width=True)
+
+                        st.subheader("Embedding Space Visualization")
+                        words_to_plot = [word] + [w for w, _ in sims[:5]]
+                        fig = visualize_term_embeddings(term_vectors, words_to_plot)
+                        if fig:
+                            st.pyplot(fig)
+                        else:
+                            st.warning("Not enough valid words to plot.")
                     else:
-                        st.warning("Could not generate visualization for these words.")
-                    
-                    # Explanation of results
-                    with st.expander("Interpretation of Results"):
-                        st.markdown(f"""
-                        The Word2Vec {model_choice} model has learned semantic relationships between words 
-                        in the article. Words that appear in similar contexts have similar vector representations.
-                        
-                        For the word **'{word}'**, the most similar words are:
-                        - **{similar_words[0][0]}** (similarity: {similar_words[0][1]:.3f})
-                        - **{similar_words[1][0]}** (similarity: {similar_words[1][1]:.3f})
-                        - **{similar_words[2][0]}** (similarity: {similar_words[2][1]:.3f})
-                        
-                        These similarities suggest that these words often appear in similar contexts 
-                        within the article, indicating semantic relatedness.
-                        """)
-                else:
-                    st.warning(f"Word '{word}' not found in the vocabulary. Try another word.")
+                        st.warning(f"'{word}' not in vocabulary or no similar terms found. Try another word.")
             else:
-                st.warning("Not enough content to train Word2Vec models. The article might be too short.")
+                st.warning("Not enough content to build embeddings (article may be too short).")
 
         with tab5:
             st.header("Advanced Linguistic Analysis")
-            
-            # User input for custom text analysis
+
+            # Choose text source
             analysis_option = st.radio(
                 "Choose text to analyze:",
                 ["Use Wikipedia article content", "Enter custom text"],
                 horizontal=True
             )
-            
+
             if analysis_option == "Use Wikipedia article content":
                 text_to_analyze = " ".join(nltk.sent_tokenize(content)[:3])
                 st.info(f"Analyzing first few sentences from: {page.title}")
@@ -801,66 +679,35 @@ if wiki_url:
                     height=100,
                     help="Enter any text you want to analyze for POS tagging and NER"
                 )
-            
+
             if text_to_analyze:
                 st.markdown(f"**Text to analyze:** {text_to_analyze}")
-                
+
                 nlp_tab1, nlp_tab2 = st.tabs(["Part-of-Speech (POS) Tagging", "Named Entity Recognition (NER)"])
-                
+
                 with nlp_tab1:
                     st.subheader("Grammatical Components (POS)")
-                    pos_results = perform_pos_tagging(text_to_analyze, num_sentences=10)
-                    
-                    # Create a color mapping for POS tags
-                    def color_pos_tag(val):
-                        if val.startswith('NN'): return 'background-color: #FFD700'  # Nouns - gold
-                        elif val.startswith('VB'): return 'background-color: #90EE90'  # Verbs - light green
-                        elif val.startswith('JJ'): return 'background-color: #ADD8E6'  # Adjectives - light blue
-                        elif val.startswith('RB'): return 'background-color: #FFB6C1'  # Adverbs - light pink
-                        else: return ''
-                    
-                    for i, (sent, tags) in enumerate(pos_results, 1):
-                        st.markdown(f"**Sentence {i}:** `{sent}`")
-                        df_tags = pd.DataFrame(tags, columns=["Token", "POS Tag"])
-                        
-                        # Apply styling with proper CSS format
-                        styled_df = df_tags.style.applymap(color_pos_tag, subset=['POS Tag'])
-                        st.dataframe(styled_df, use_container_width=True)
+                    if nlp_spacy is not None:
+                        doc = nlp_spacy(text_to_analyze)
+                        rows = [(t.text, t.pos_, t.tag_) for t in doc]
+                        df_tags = pd.DataFrame(rows, columns=["Token", "POS", "Tag"])
+                        st.dataframe(df_tags, use_container_width=True)
+                    else:
+                        st.warning("spaCy not available. Install spaCy to enable fast POS tagging.")
 
                 with nlp_tab2:
                     st.subheader("Identified Entities (NER)")
-                    ner_results = perform_ner(text_to_analyze, num_sentences=10)
-                    
-                    # Create a color mapping for entity types
-                    def color_entity_type(val):
-                        if val == 'PERSON': return 'background-color: #FF9999'  # People - light red
-                        elif val in ['ORGANIZATION', 'ORG']: return 'background-color: #99CCFF'  # Organizations - light blue
-                        elif val in ['GPE', 'LOCATION']: return 'background-color: #99FF99'  # Locations - light green
-                        elif val in ['DATE', 'TIME']: return 'background-color: #FFCC99'  # Dates/Times - light orange
-                        else: return ''
-                    
-                    all_entities = []
-                    for sent, tree in ner_results:
-                        st.markdown(f"**Sentence:** `{sent}`")
-                        entities = []
-                        
-                        if hasattr(tree, 'label'):
-                            for node in tree:
-                                if isinstance(node, nltk.Tree):
-                                    entity_type = node.label()
-                                    entity_text = " ".join([token for token, pos in node.leaves()])
-                                    entities.append((entity_text, entity_type))
-                        
-                        if entities:
-                            df_entities = pd.DataFrame(entities, columns=["Entity", "Type"])
-                            
-                            # Apply styling with proper CSS format
-                            styled_entities = df_entities.style.applymap(color_entity_type, subset=['Type'])
-                            st.dataframe(styled_entities, use_container_width=True)
+                    if nlp_spacy is not None:
+                        doc = nlp_spacy(text_to_analyze)
+                        ents = [(ent.text, ent.label_) for ent in doc.ents]
+                        if ents:
+                            df_entities = pd.DataFrame(ents, columns=["Entity", "Type"])
+                            st.dataframe(df_entities, use_container_width=True)
                         else:
-                            st.info("No named entities found in this sentence.")
-                        st.markdown("---")
-                    
+                            st.info("No named entities found in this text.")
+                    else:
+                        st.warning("spaCy not available. Install spaCy to enable NER.")
+
             else:
                 st.warning("Please enter text to analyze.")
 
@@ -876,19 +723,23 @@ if wiki_url:
                     placeholder="Paste gold summary here to compute ROUGE-1/2/L..."
                 )
 
-                colm = st.columns(4)
-                # Always compute length & redundancy metrics for the generated summary
                 st.subheader("Evaluation Metrics")
-                gen_sum = st.session_state.get("generated_summary", "")
-                ref_summary = st.text_area("Reference Summary (optional)", "")
                 if gen_sum:
                     perp = calc_perplexity(gen_sum)
                     st.metric("Perplexity", perp)
                     if ref_summary.strip():
                         cos = calc_cosine_similarity(gen_sum, ref_summary)
+                        r1 = rouge_n(gen_sum, ref_summary, n=1)
+                        r2 = rouge_n(gen_sum, ref_summary, n=2)
+                        rl = rouge_l(gen_sum, ref_summary)
                         st.metric("Cosine Similarity", round(cos, 4))
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("ROUGE-1 F1", r1[2])
+                        c2.metric("ROUGE-2 F1", r2[2])
+                        c3.metric("ROUGE-L F1", rl[2])
+                    redun = summary_redundancy_ratio(gen_sum)
+                    st.metric("Redundancy Ratio (bigrams)", redun)
 
-                # Keywords evaluation
                 ref_kw_text = st.text_input(
                     "Reference keywords (comma-separated, optional):",
                     placeholder="e.g., nlp, corpus, tokenization, language model"
@@ -903,51 +754,52 @@ if wiki_url:
                     colk2.metric("Keywords Recall", r)
                     colk3.metric("Keywords F1", f1)
 
-                st.caption("Tip: Use this section to satisfy rubric items on quantitative results (ROUGE/F1), interpretation, and presentation.")
+                st.caption("Use this section for quantitative results (ROUGE/F1), interpretation, and presentation.")
 
         with tab6:
             st.header("Project Timeline & Details")
             st.plotly_chart(create_timeline_chart(), use_container_width=True)
-            
+
             st.subheader("Challenges & Solutions")
             st.markdown("""
             - **Challenge:** Inconsistent Wikipedia markup.
-              - **Solution:** Developed a multi-stage regex cleaning pipeline.
-            - **Challenge:** Summarizer producing repetitive sentences.
+              - **Solution:** Multi-stage regex cleaning pipeline.
+            - **Challenge:** Summarizer produced repetitive sentences.
               - **Solution:** Implemented Maximal Marginal Relevance (MMR) to promote diversity.
             - **Challenge:** Slow performance on large articles.
-              - **Solution:** Used Streamlit's `@st.cache_data` to cache expensive computations.
-            - **Challenge:** Training Word2Vec on short articles.
-              - **Solution:** Implemented fallbacks and validations for insufficient content.
+              - **Solution:** Cached expensive computations with `@st.cache_data`.
+            - **Challenge:** Word2Vec/Scipy incompatibility on Python 3.13.
+              - **Solution:** Replaced with co-occurrence-based embeddings (no SciPy/Gensim).
             """)
-            
+
             st.subheader("Limitations")
             st.warning("""
-            - This tool is optimized for **English** language articles.
-            - The NLP models (POS, NER) are pre-trained and may have lower accuracy on highly specialized or novel topics.
-            - The summary is **extractive**, meaning it selects sentences, and may not be as coherent as a human-written summary.
-            - Word2Vec models trained on single articles have limited vocabulary and context.
-            - Information retrieval is based on TF-IDF which may not capture semantic meaning as well as modern transformers.
+            - Optimized for **English** articles.
+            - Extractive summary may be less coherent than human-written abstractive summaries.
+            - Co-occurrence embeddings are local to the article and vocabulary is limited.
+            - TF-IDF retrieval is lexical; it may miss deep semantics vs. transformer-based models.
             """)
-            
+
             st.subheader("Tool & Library Justifications")
             st.markdown("""
-            - **NLTK**: Comprehensive NLP toolkit with robust implementations of standard algorithms
-            - **Scikit-learn**: Industry-standard machine learning library with efficient TF-IDF implementation
-            - **Gensim**: Specialized library for topic modeling and word embeddings
-            - **Streamlit**: Enables rapid development of interactive web applications for data science
-            - **Plotly/Matplotlib**: Provide rich, interactive visualizations for data exploration
+            - **NLTK**: Tokenization and classic NLP utilities.
+            - **spaCy**: Fast, production-grade POS/NER.
+            - **Scikit-learn**: TF-IDF, cosine similarity, PCA.
+            - **Streamlit**: Rapid interactive dashboarding.
+            - **Plotly/Matplotlib**: Rich visualizations.
             """)
-            
+
         # --- SIDEBAR ---
         st.sidebar.header("Download Center")
+        summary = st.session_state.get("generated_summary", "")
+        keywords = st.session_state.get("generated_keywords", [])
         st.sidebar.download_button(
             label="📥 Export Analysis (JSON)",
             data=json.dumps({
                 "title": page.title,
                 "url": wiki_url,
-                "summary": summary if 'summary' in locals() else "",
-                "keywords": keywords if 'keywords' in locals() else [],
+                "summary": summary,
+                "keywords": keywords,
                 "stats": {
                     "word_count": wc,
                     "unique_words": uw,
@@ -960,7 +812,7 @@ if wiki_url:
             mime="application/json"
         )
         st.sidebar.markdown("---")
-        st.sidebar.info("This app uses NLTK, Scikit-learn, and Gensim for NLP tasks. UI built with Streamlit.")
+        st.sidebar.info("This app uses NLTK, spaCy, and scikit-learn for NLP tasks. UI built with Streamlit.")
 
 else:
     st.info("Please enter a Wikipedia URL above to begin the analysis.")
