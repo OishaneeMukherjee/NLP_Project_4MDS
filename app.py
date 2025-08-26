@@ -233,17 +233,17 @@ def calculate_flesch_score(text):
 def create_timeline_chart():
     """Create development timeline visualization."""
     df = pd.DataFrame([
-        dict(Task="Research & Planning", Start='2025-08-01', End='2025-08-05', Resource="Planning"),
-        dict(Task="API Integration", Start='2025-08-06', End='2025-08-10', Resource="Development"),
-        dict(Task="NLP Implementation", Start='2025-08-11', End='2025-08-17', Resource="Development"),
-        dict(Task="UI Development", Start='2025-08-18', End='2025-08-21', Resource="Development"),
-        dict(Task="Testing & Deployment", Start='2025-08-22', End='2025-08-24', Resource="Finalization")
+        dict(Task="Research & Planning", Start='2025-08-17', End='2025-08-18', Resource="Planning"),
+        dict(Task="NLP Implementation", Start='2025-08-19', End='2025-08-22', Resource="Development"),
+        dict(Task="UI Development", Start='2025-08-23', End='2025-08-25', Resource="Development"),
     ])
+
     fig = px.timeline(df, x_start="Start", x_end="End", y="Task", color="Resource",
-                      title="Project Development Timeline (August 1-24, 2025)")
+                      title="Project Development Timeline (August 17-25, 2025)")
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(height=400)
     return fig
+
 
 # >>> ROUGE & metrics helpers
 def _tokenize_words(text: str):
@@ -261,10 +261,11 @@ def _prec_recall_f1(overlap, pred, gold):
 def rouge_n(hypothesis: str, reference: str, n: int = 1):
     hyp_tokens = _tokenize_words(hypothesis)
     ref_tokens = _tokenize_words(reference)
-    hyp_ngrams = _ngrams(hyp_tokens, n)
-    ref_ngrams = _ngrams(ref_tokens, n)
-    overlap = len([g for g in hyp_ngrams if g in set(ref_ngrams)])
-    return _prec_recall_f1(overlap, len(hyp_ngrams), len(ref_ngrams))
+    hyp_ngrams = Counter(_ngrams(hyp_tokens, n))
+    ref_ngrams = Counter(_ngrams(ref_tokens, n))
+    overlap = sum((hyp_ngrams & ref_ngrams).values())  # true multiset overlap
+    return _prec_recall_f1(overlap, sum(hyp_ngrams.values()), sum(ref_ngrams.values()))
+
 
 def _lcs_length(a, b):
     m, n = len(a), len(b)
@@ -297,15 +298,22 @@ def calc_cosine_similarity(text1, text2):
     vec = TfidfVectorizer().fit_transform([text1, text2])
     return cosine_similarity(vec[0:1], vec[1:2])[0][0]
 
-def calc_perplexity(text):
+def calc_perplexity(text, smoothing=1e-8):
+    """Calculate perplexity based on unigram LM with Laplace smoothing."""
     tokens = [w.lower() for w in nltk.word_tokenize(text) if w.isalpha()]
     if not tokens:
         return 0.0
     freq = Counter(tokens)
-    total = len(tokens)
-    probs = [freq[w] / total for w in tokens]
-    entropy = -sum(p * math.log(p, 2) for p in probs)
+    total = sum(freq.values())
+    # convert to probabilities with smoothing
+    probs = {w: (freq[w] + smoothing) / (total + smoothing * len(freq)) for w in freq}
+    # average log probability
+    log_prob = 0.0
+    for w in tokens:
+        log_prob += math.log(probs.get(w, smoothing), 2)
+    entropy = -log_prob / len(tokens)
     return round(2 ** entropy, 4)
+
 
 # ---------------------------
 # Information Retrieval
@@ -476,6 +484,15 @@ def show_methodology_diagrams():
     Ranked Results → Top-K Retrieval
     ```
     """)
+
+def diversity_score(text):
+    """Simple diversity: unique bigrams / total bigrams"""
+    toks = _tokenize_words(text)
+    bigs = _ngrams(toks, 2)
+    if not bigs:
+        return 0.0
+    return round(len(set(bigs)) / len(bigs), 4)
+
 
 # ---------------------------
 # Streamlit UI
@@ -725,34 +742,30 @@ if wiki_url:
 
                 st.subheader("Evaluation Metrics")
                 if gen_sum:
+                    # --- Improved Evaluation Metrics ---
                     perp = calc_perplexity(gen_sum)
-                    st.metric("Perplexity", perp)
+                    st.metric("Perplexity (unigram LM)", perp, help="Lower is better; <100 usually indicates good fluency")
+
                     if ref_summary.strip():
                         cos = calc_cosine_similarity(gen_sum, ref_summary)
                         r1 = rouge_n(gen_sum, ref_summary, n=1)
                         r2 = rouge_n(gen_sum, ref_summary, n=2)
                         rl = rouge_l(gen_sum, ref_summary)
-                        st.metric("Cosine Similarity", round(cos, 4))
+                        st.metric("Cosine Similarity", round(cos, 4), help="Higher is better; closer to 1 means more overlap")
                         c1, c2, c3 = st.columns(3)
                         c1.metric("ROUGE-1 F1", r1[2])
                         c2.metric("ROUGE-2 F1", r2[2])
                         c3.metric("ROUGE-L F1", rl[2])
-                    redun = summary_redundancy_ratio(gen_sum)
-                    st.metric("Redundancy Ratio (bigrams)", redun)
 
-                ref_kw_text = st.text_input(
-                    "Reference keywords (comma-separated, optional):",
-                    placeholder="e.g., nlp, corpus, tokenization, language model"
-                )
-                if ref_kw_text.strip():
-                    gold = {k.strip().lower() for k in ref_kw_text.split(",") if k.strip()}
-                    pred = {k.strip().lower() for k in st.session_state.get("generated_keywords", [])}
-                    overlap = len(gold.intersection(pred))
-                    p, r, f1 = _prec_recall_f1(overlap, len(pred), len(gold))
-                    colk1, colk2, colk3 = st.columns(3)
-                    colk1.metric("Keywords Precision", p)
-                    colk2.metric("Keywords Recall", r)
-                    colk3.metric("Keywords F1", f1)
+                    # Redundancy & Diversity
+                    redun = summary_redundancy_ratio(gen_sum)
+                    div = diversity_score(gen_sum)
+                    c4, c5 = st.columns(2)
+                    c4.metric("Redundancy (bigrams)", redun, help="Lower = less repetition")
+                    c5.metric("Diversity Score", div, help="Higher = more diverse summary")
+
+
+                
 
                 st.caption("Use this section for quantitative results (ROUGE/F1), interpretation, and presentation.")
 
